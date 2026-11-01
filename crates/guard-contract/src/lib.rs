@@ -22,7 +22,7 @@
 pub mod oneclick;
 
 use near_sdk::json_types::{Base64VecU8, U128, U64};
-use near_sdk::store::{LookupSet, Vector};
+use near_sdk::store::{IterableMap, LookupSet, Vector};
 use near_sdk::{
     env, near, require, AccountId, BorshStorageKey, Gas, NearToken, PanicOnDefault, Promise,
 };
@@ -38,10 +38,10 @@ const SIGNATURE_LEN: usize = 64;
 /// The rolling window the daily and per-counterparty caps are measured over.
 const SECONDS_PER_DAY: u64 = 86_400;
 
-/// The NEAR Intents account the guard releases funds through. Funds leave the guard as an
+/// Default NEAR Intents account the guard releases funds through. Funds leave the guard as an
 /// `mt_transfer` of its NEP-245 balance inside this contract to the quote's deposit address
-/// (design.md section 12). There is no NEAR Intents testnet, so this is the same on mainnet
-/// and in a sandbox mock.
+/// (design.md section 12). There is no NEAR Intents testnet, so a sandbox points the guard at a
+/// stub with [`GuardContract::set_intents_account`]; mainnet leaves this default.
 const INTENTS_ACCOUNT: &str = "intents.near";
 
 /// Gas attached to the `mt_transfer` cross-contract call.
@@ -166,6 +166,8 @@ enum StorageKey {
     UsedNonces,
     /// The recent payments the rolling caps are measured over.
     Spends,
+    /// 1Click destination asset ids the owner has approved, mapped to their chain.
+    AssetChains,
 }
 
 /// Guard contract state.
@@ -183,6 +185,16 @@ pub struct GuardContract {
     oneclick_pubkeys: Vec<[u8; PUBKEY_LEN]>,
     /// The active policy.
     policy: Policy,
+    /// 1Click destination asset ids the owner has approved, each mapped to the chain it
+    /// settles on (`"base"` or `"bsc"`). A payment is refused unless its quote's
+    /// `destinationAsset` is registered here for the verdict's chain. This replaces parsing
+    /// 1Click's asset-id string in-contract: the owner, not a string heuristic, decides
+    /// which assets are payable.
+    asset_chains: IterableMap<String, String>,
+    /// The NEAR Intents account the guard releases funds through (`mt_transfer`). Defaults to
+    /// [`INTENTS_ACCOUNT`]; owner-settable so a sandbox or an alternate deployment can point
+    /// it at a stub. Mainnet leaves the default.
+    intents_account: AccountId,
     /// Replay protection. A nonce is recorded the first time it is honoured and
     /// refused ever after.
     used_nonces: LookupSet<u128>,
@@ -202,6 +214,10 @@ impl GuardContract {
             chainward_pubkey: to_pubkey(chainward_pubkey),
             oneclick_pubkeys: oneclick::ONE_CLICK_MANAGER_KEYS.to_vec(),
             policy,
+            asset_chains: IterableMap::new(StorageKey::AssetChains),
+            intents_account: INTENTS_ACCOUNT
+                .parse()
+                .unwrap_or_else(|_| env::panic_str("intents account id is invalid")),
             used_nonces: LookupSet::new(StorageKey::UsedNonces),
             spends: Vector::new(StorageKey::Spends),
         }
@@ -229,6 +245,41 @@ impl GuardContract {
         self.assert_owner();
         require!(!pubkeys.is_empty(), "need at least one 1Click key");
         self.oneclick_pubkeys = pubkeys.into_iter().map(to_pubkey).collect();
+    }
+
+    /// Registers (or re-points) a 1Click destination asset id to the chain it settles on.
+    /// Owner only.
+    ///
+    /// This is how the owner, rather than an in-contract string heuristic, decides which
+    /// destination assets are payable: `request_payment` refuses any quote whose
+    /// `destinationAsset` is not registered here for the verdict's chain. `chain` must be
+    /// `"base"` or `"bsc"` (matching the verdict's `chain` field), so a typo'd chain that no
+    /// verdict could ever match is refused up front rather than silently bricking a route.
+    pub fn set_asset_chain(&mut self, asset_id: String, chain: String) {
+        self.assert_owner();
+        require!(
+            chain == "base" || chain == "bsc",
+            "chain must be base or bsc"
+        );
+        require!(!asset_id.is_empty(), "asset id must not be empty");
+        self.asset_chains.insert(asset_id, chain);
+    }
+
+    /// Removes a registered destination asset. Owner only. Afterwards a payment whose quote
+    /// settles in that asset is refused as unregistered.
+    pub fn remove_asset_chain(&mut self, asset_id: String) {
+        self.assert_owner();
+        self.asset_chains.remove(&asset_id);
+    }
+
+    /// Points the guard at the NEAR Intents account it releases funds through. Owner only.
+    ///
+    /// Mainnet leaves the default (`intents.near`). A sandbox or a test network sets this to a
+    /// stub that receives the `mt_transfer`, since NEAR Intents has no testnet (design.md
+    /// section 6).
+    pub fn set_intents_account(&mut self, account_id: AccountId) {
+        self.assert_owner();
+        self.intents_account = account_id;
     }
 
     /// Funds the guard. Owner only, and a deposit must be attached.
@@ -284,11 +335,12 @@ impl GuardContract {
     ///    and the rolling 24h per-counterparty cap.
     ///
     /// Between the verdict gate and the nonce, it also verifies 1Click's **quote** signature
-    /// over `quote` and binds the two together: the quote's deposit address, recipient, chain
-    /// and amount must be the ones the verdict signed, the quote must not be dry or carry a
-    /// redirect vector, and its deposit deadline must still be in the future. So the guard
-    /// pays a deposit address only when 1Click has signed that it leads to the destination
-    /// ChainWard signed off on. See [`oneclick`].
+    /// over `quote` and binds the two together: the quote's deposit address, recipient and
+    /// amount must be the ones the verdict signed, its destination asset must be one the owner
+    /// registered (`set_asset_chain`) for the verdict's chain, the quote must not be dry or
+    /// carry a redirect vector, and its deposit deadline must still be in the future. So the
+    /// guard pays a deposit address only when 1Click has signed that it leads to the
+    /// destination ChainWard signed off on. See [`oneclick`].
     ///
     /// Then it records the spend and releases the funds. Funds leave as an `mt_transfer` of the
     /// guard's NEP-245 balance inside [`INTENTS_ACCOUNT`] to the quote's deposit address
@@ -364,8 +416,17 @@ impl GuardContract {
             terms.recipient.to_ascii_lowercase() == auth.destination,
             "quote recipient does not match the verdict destination"
         );
+        // The chain binding: the quote's destination asset must be one the owner has
+        // registered (set_asset_chain), and registered for the verdict's chain. This is an
+        // owner-curated allowlist rather than parsing 1Click's asset-id string in-contract,
+        // which is their format, not a standard (ops/near/quote-signature.md section 4).
+        let registered_chain = self.asset_chains.get(&terms.destination_asset).cloned();
         require!(
-            terms.destination_chain() == Some(auth.chain.as_str()),
+            registered_chain.is_some(),
+            "destination asset not registered"
+        );
+        require!(
+            registered_chain.as_deref() == Some(auth.chain.as_str()),
             "quote destination asset is not on the verdict's chain"
         );
         require!(
@@ -428,9 +489,7 @@ impl GuardContract {
         //     bound us to; `token_id` is the origin asset read out of the verified quote.
         //     `mt_transfer` requires exactly one yoctoNEAR. The call is scheduled as a receipt
         //     when the Promise is dropped; `_` consumes the `#[must_use]`.
-        let intents: AccountId = INTENTS_ACCOUNT
-            .parse()
-            .unwrap_or_else(|_| env::panic_str("intents account id is invalid"));
+        let intents = self.intents_account.clone();
         let mt_args = near_sdk::serde_json::json!({
             "receiver_id": auth.deposit_address,
             "token_id": terms.origin_asset,
@@ -497,6 +556,24 @@ impl GuardContract {
     /// Total paid to one EVM destination in the last 24h.
     pub fn get_counterparty_spent(&self, destination: String) -> U128 {
         U128(self.sum_window(now_seconds(), Some(&destination)))
+    }
+
+    /// The chain a destination asset is registered for, or `None` if it is not registered.
+    pub fn get_asset_chain(&self, asset_id: String) -> Option<String> {
+        self.asset_chains.get(&asset_id).cloned()
+    }
+
+    /// Every registered `(asset id, chain)` route, for the demo and for judges.
+    pub fn get_asset_chains(&self) -> Vec<(String, String)> {
+        self.asset_chains
+            .iter()
+            .map(|(asset, chain)| (asset.clone(), chain.clone()))
+            .collect()
+    }
+
+    /// The NEAR Intents account the guard releases funds through.
+    pub fn get_intents_account(&self) -> AccountId {
+        self.intents_account.clone()
     }
 }
 
@@ -724,9 +801,18 @@ mod tests {
         SigningKey::from_bytes(&[13u8; 32])
     }
 
-    /// A guard whose registered verdict key is `verdict_key()` and whose 1Click key is the
-    /// test manager key, owned by `accounts(1)`.
+    /// A guard whose registered verdict key is `verdict_key()`, whose 1Click key is the test
+    /// manager key, and with the synthetic quotes' destination assets registered, owned by
+    /// `accounts(1)`.
     fn guard_with(key: &SigningKey) -> GuardContract {
+        let mut guard = guard_with_no_assets(key);
+        register_test_assets(&mut guard);
+        guard
+    }
+
+    /// Like [`guard_with`] but with no destination asset registered, so the asset-chain gate
+    /// can be exercised on its own.
+    fn guard_with_no_assets(key: &SigningKey) -> GuardContract {
         testing_env!(context(accounts(1)).build());
         let pubkey: Base64VecU8 = key.verifying_key().to_bytes().to_vec().into();
         let mut guard = GuardContract::new(accounts(1), pubkey, sample_policy());
@@ -744,6 +830,24 @@ mod tests {
         testing_env!(context(accounts(1)).build());
         let key: Base64VecU8 = oneclick_key().verifying_key().to_bytes().to_vec().into();
         guard.set_oneclick_pubkeys(vec![key]);
+    }
+
+    /// Registers the destination assets the synthetic test quotes settle in, so a well-formed
+    /// payment reaches the policy checks. This mirrors what the owner does once on deploy.
+    fn register_test_assets(guard: &mut GuardContract) {
+        testing_env!(context(accounts(1)).build());
+        guard.set_asset_chain(
+            "nep141:base-0xtest.omft.near".to_string(),
+            "base".to_string(),
+        );
+        guard.set_asset_chain(
+            "nep245:v2_1.omni.hot.tg:56_test".to_string(),
+            "bsc".to_string(),
+        );
+        guard.set_asset_chain(
+            "nep245:v2_1.omni.hot.tg:56_usdc".to_string(),
+            "bsc".to_string(),
+        );
     }
 
     /// Signs `payload` exactly as 1Click does: ed25519 over `base58(sha256(payload))`.
@@ -1059,6 +1163,7 @@ mod tests {
         let pubkey: Base64VecU8 = key.verifying_key().to_bytes().to_vec().into();
         let mut guard = GuardContract::new(accounts(1), pubkey, policy);
         register_test_oneclick_key(&mut guard);
+        register_test_assets(&mut guard);
         guard
     }
 
@@ -1359,7 +1464,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "quote destination asset is not on the verdict's chain")]
     fn a_quote_on_the_wrong_chain_is_refused() {
-        // Verdict is for Base; the quote delivers on BNB Chain to the same address.
+        // Verdict is for Base; the quote delivers on BNB Chain to the same address. The BNB
+        // asset is registered (as "bsc"), so the guard refuses on the chain mismatch rather
+        // than on the asset being unknown.
         let (mut guard, auth, signature) = verdict_and_guard();
         let payload = quote_payload(
             accounts(3).as_str(),
@@ -1443,5 +1550,171 @@ mod tests {
         let keys = guard.get_oneclick_pubkeys();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].0, oneclick::ONE_CLICK_MANAGER_KEYS[0].to_vec());
+    }
+
+    // --- The owner-registered destination-asset allowlist (the chain binding) ---
+
+    #[test]
+    fn owner_can_register_and_read_an_asset_chain() {
+        let mut guard = owned_guard();
+        testing_env!(context(accounts(1)).build());
+        guard.set_asset_chain(
+            "nep141:base-0xabc.omft.near".to_string(),
+            "base".to_string(),
+        );
+        assert_eq!(
+            guard.get_asset_chain("nep141:base-0xabc.omft.near".to_string()),
+            Some("base".to_string())
+        );
+        assert_eq!(
+            guard.get_asset_chain("nep141:unregistered".to_string()),
+            None
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "owner only")]
+    fn registering_an_asset_chain_is_owner_only() {
+        let mut guard = owned_guard();
+        testing_env!(context(accounts(2)).build());
+        guard.set_asset_chain(
+            "nep141:base-0xabc.omft.near".to_string(),
+            "base".to_string(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "chain must be base or bsc")]
+    fn registering_an_asset_for_an_unknown_chain_is_refused() {
+        // A chain no verdict could ever match is refused up front, not stored as a dead route.
+        let mut guard = owned_guard();
+        testing_env!(context(accounts(1)).build());
+        guard.set_asset_chain("nep141:eth-0xabc".to_string(), "ethereum".to_string());
+    }
+
+    #[test]
+    #[should_panic(expected = "asset id must not be empty")]
+    fn registering_an_empty_asset_id_is_refused() {
+        let mut guard = owned_guard();
+        testing_env!(context(accounts(1)).build());
+        guard.set_asset_chain(String::new(), "base".to_string());
+    }
+
+    #[test]
+    fn owner_can_remove_an_asset_chain() {
+        let mut guard = owned_guard();
+        testing_env!(context(accounts(1)).build());
+        guard.set_asset_chain("nep245:bsc-usdc".to_string(), "bsc".to_string());
+        assert_eq!(
+            guard.get_asset_chain("nep245:bsc-usdc".to_string()),
+            Some("bsc".to_string())
+        );
+        guard.remove_asset_chain("nep245:bsc-usdc".to_string());
+        assert_eq!(guard.get_asset_chain("nep245:bsc-usdc".to_string()), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "owner only")]
+    fn removing_an_asset_chain_is_owner_only() {
+        let mut guard = owned_guard();
+        testing_env!(context(accounts(1)).build());
+        guard.set_asset_chain("nep245:bsc-usdc".to_string(), "bsc".to_string());
+        testing_env!(context(accounts(2)).build());
+        guard.remove_asset_chain("nep245:bsc-usdc".to_string());
+    }
+
+    #[test]
+    fn get_asset_chains_lists_every_registered_route() {
+        let mut guard = owned_guard();
+        testing_env!(context(accounts(1)).build());
+        guard.set_asset_chain("base-usdc".to_string(), "base".to_string());
+        guard.set_asset_chain("bsc-usdc".to_string(), "bsc".to_string());
+        let mut routes = guard.get_asset_chains();
+        routes.sort();
+        assert_eq!(
+            routes,
+            vec![
+                ("base-usdc".to_string(), "base".to_string()),
+                ("bsc-usdc".to_string(), "bsc".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "destination asset not registered")]
+    fn a_payment_whose_asset_is_not_registered_is_refused() {
+        // A clean, in-policy verdict with a well-signed, matching quote, but the quote's
+        // destination asset was never registered by the owner. The guard will not settle a
+        // route it was not told about, even though both signatures are genuine.
+        let key = verdict_key();
+        let mut guard = guard_with_no_assets(&key);
+        pay_env();
+        let auth = valid_auth();
+        let signature = sign(&auth, &key);
+        let _ = pay(&mut guard, auth, signature);
+    }
+
+    #[test]
+    fn registering_the_asset_lets_the_same_payment_through() {
+        // The companion to the test above: once the owner registers the asset for the
+        // verdict's chain, the identical payment is honoured.
+        let key = verdict_key();
+        let mut guard = guard_with_no_assets(&key);
+        testing_env!(context(accounts(1)).build());
+        guard.set_asset_chain(
+            "nep141:base-0xtest.omft.near".to_string(),
+            "base".to_string(),
+        );
+        pay_env();
+        let auth = valid_auth();
+        let signature = sign(&auth, &key);
+        assert!(pay(&mut guard, auth, signature).paid);
+    }
+
+    // --- The configurable NEAR Intents account the guard releases through ---
+
+    #[test]
+    fn the_intents_account_defaults_to_intents_near() {
+        let guard = owned_guard();
+        assert_eq!(
+            guard.get_intents_account(),
+            "intents.near".parse::<AccountId>().unwrap()
+        );
+    }
+
+    #[test]
+    fn the_owner_can_point_the_intents_account_at_a_stub() {
+        let mut guard = owned_guard();
+        testing_env!(context(accounts(1)).build());
+        let stub: AccountId = "intents.test.near".parse().unwrap();
+        guard.set_intents_account(stub.clone());
+        assert_eq!(guard.get_intents_account(), stub);
+    }
+
+    #[test]
+    #[should_panic(expected = "owner only")]
+    fn setting_the_intents_account_is_owner_only() {
+        let mut guard = owned_guard();
+        testing_env!(context(accounts(2)).build());
+        guard.set_intents_account("intents.test.near".parse().unwrap());
+    }
+
+    #[test]
+    fn the_release_goes_to_the_configured_intents_account() {
+        // When the owner points the guard at a stub (as the sandbox does), the mt_transfer
+        // receipt is addressed to that stub, not to the mainnet intents.near.
+        let key = verdict_key();
+        let mut guard = guard_with(&key);
+        testing_env!(context(accounts(1)).build());
+        let stub: AccountId = "intents.test.near".parse().unwrap();
+        guard.set_intents_account(stub.clone());
+        pay_env();
+        let auth = valid_auth();
+        let signature = sign(&auth, &key);
+        let _ = pay(&mut guard, auth, signature);
+
+        let receipts = get_created_receipts();
+        assert_eq!(receipts.len(), 1, "exactly one release");
+        assert_eq!(receipts[0].receiver_id, stub, "released through the stub");
     }
 }

@@ -80,7 +80,8 @@ pub struct QuoteTerms {
     pub dry: bool,
     /// The asset deposited, e.g. `nep245:...` — what the guard `mt_transfer`s.
     pub origin_asset: String,
-    /// The asset delivered at the destination; its id carries the destination chain.
+    /// The asset delivered at the destination. The guard matches this against the owner's
+    /// `set_asset_chain` registry rather than parsing the id's format itself.
     pub destination_asset: String,
     /// The EVM address the funds surface at. Checksummed by 1Click; compare case-folded.
     pub recipient: String,
@@ -143,24 +144,6 @@ impl QuoteTerms {
         !is_unset(&self.virtual_chain_recipient)
             || !is_unset(&self.virtual_chain_refund_recipient)
             || !is_unset(&self.custom_recipient_msg)
-    }
-
-    /// Maps `destination_asset` to `"base"` or `"bsc"`, or `None` if it is neither.
-    ///
-    /// 1Click's asset ids put the chain in the id: Base assets read `nep141:base-…` or
-    /// `nep141:base.…`; BNB Chain assets carry the `:56_` chain-id segment. This is the
-    /// weakest link in the binding because the id format is 1Click's, not a standard; the
-    /// owner-set allowlist in the contract is what actually bounds which assets are payable,
-    /// and this is a cross-check on top of it. See `ops/near/quote-signature.md`.
-    pub fn destination_chain(&self) -> Option<&'static str> {
-        let asset = &self.destination_asset;
-        if asset.contains(":base-") || asset.contains(":base.") {
-            Some("base")
-        } else if asset.contains(":56_") || asset.contains(":bsc-") || asset.contains(":bsc.") {
-            Some("bsc")
-        } else {
-            None
-        }
     }
 }
 
@@ -284,7 +267,8 @@ mod tests {
         #[serde(rename = "amountIn")]
         amount_in: String,
         deadline: String,
-        chain: String,
+        #[serde(rename = "destinationAsset")]
+        destination_asset: String,
     }
 
     fn fixture() -> Fixture {
@@ -341,7 +325,7 @@ mod tests {
             terms.deadline.as_deref(),
             Some(f.expected.deadline.as_str())
         );
-        assert_eq!(terms.destination_chain(), Some(f.expected.chain.as_str()));
+        assert_eq!(terms.destination_asset, f.expected.destination_asset);
         assert!(!terms.dry);
         assert!(!terms.has_redirect_vector());
         assert_eq!(terms.recipient_type, "DESTINATION_CHAIN");
@@ -442,7 +426,7 @@ mod tests {
         let terms = verify_quote(&quote, &[key.verifying_key().to_bytes()]).unwrap();
         assert_eq!(terms.amount_in, "5");
         assert_eq!(terms.recipient.to_ascii_lowercase(), "0xabcd");
-        assert_eq!(terms.destination_chain(), Some("base"));
+        assert_eq!(terms.destination_asset, "nep141:base-0xabc.omft.near");
         assert!(!terms.has_redirect_vector());
     }
 
@@ -478,15 +462,6 @@ mod tests {
         let payload = r#"{"amountIn":"5","depositType":"INTENTS","destinationAsset":"nep141:base-0xabc.omft.near","dry":false,"originAsset":"o","recipient":"0xabcd","recipient":"0xdead","recipientType":"DESTINATION_CHAIN"}"#;
         let quote = sign_quote(payload, &key);
         assert!(verify_quote(&quote, &[key.verifying_key().to_bytes()]).is_err());
-    }
-
-    #[test]
-    fn bsc_asset_maps_to_bsc() {
-        let terms: QuoteTerms = serde_json::from_str(
-            r#"{"amountIn":"5","depositType":"INTENTS","destinationAsset":"nep245:v2_1.omni.hot.tg:56_2w93Gq","dry":false,"originAsset":"o","recipient":"0xabcd","recipientType":"DESTINATION_CHAIN"}"#,
-        )
-        .unwrap();
-        assert_eq!(terms.destination_chain(), Some("bsc"));
     }
 
     #[test]
