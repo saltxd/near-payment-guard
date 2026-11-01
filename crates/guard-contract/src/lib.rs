@@ -19,6 +19,8 @@
 //! `docs/canonical-bytes.md`). Freshness, the rolling caps and the allow/deny lists
 //! are Stage C.
 
+pub mod oneclick;
+
 use near_sdk::json_types::{Base64VecU8, U128, U64};
 use near_sdk::store::{LookupSet, Vector};
 use near_sdk::{

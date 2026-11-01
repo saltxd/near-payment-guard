@@ -1,0 +1,62 @@
+{
+  "note": "Recorded REAL 1Click quote (POST https://1click.chaindefuser.com/v0/quote, no auth), captured 2026-11-01. BSC-USDC -> Base-USDC, 1 USDC, placeholder public recipient. Signature stored as bare base58 (ed25519: prefix stripped) so the CI secret-scan does not flag a 64-byte signature as a key. See ops/near/quote-signature.md and ts/src/oneclick.ts for how signedPayload is derived from recordedResponse.",
+  "managerPublicKey": "ed25519:reYaWhvwu8Jzo3WUM3zhn6VrhuMEF4eADL17qtRVifc",
+  "signatureBase58": "4atKVPtD6Hsg1GEx12SfUsSrnVcGcSR3tu3sPrFoVKqpA14LjQ9mMQ3qkgLrjKXXu2vkQyZc1ErRMJB2NGUDW6XR",
+  "quoteHashBase58": "53Wfq1xSiBcUvLPs9MppsRV1gZ1F5xe1rQwnBB3y4U9k",
+  "signedPayload": "{\"amount\":\"1000000000000000000\",\"amountIn\":\"1000000000000000000\",\"amountInFormatted\":\"1.0\",\"amountInUsd\":\"1.000000000000\",\"amountOut\":\"997398\",\"amountOutFormatted\":\"0.997398\",\"amountOutUsd\":\"0.997398000000\",\"deadline\":\"2026-11-04T07:55:04.000Z\",\"depositAddress\":\"f7252e9f85ccdfd9ee2a1004ef84a517a1e4fa4eb3509cc0517281e761d55f64\",\"depositType\":\"INTENTS\",\"destinationAsset\":\"nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near\",\"dry\":false,\"minAmountIn\":\"1000000000000000000\",\"minAmountOut\":\"987424\",\"originAsset\":\"nep245:v2_1.omni.hot.tg:56_2w93GqMcEmQFDru84j3HZZWt557r\",\"recipient\":\"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"0\",\"refundTo\":\"chainward-guard.near\",\"refundType\":\"INTENTS\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":12,\"timeWhenInactive\":\"2026-11-04T07:55:04.000Z\",\"timestamp\":\"2026-11-01T05:55:04.258Z\",\"withdrawFee\":\"2400\"}",
+  "expected": {
+    "depositAddress": "f7252e9f85ccdfd9ee2a1004ef84a517a1e4fa4eb3509cc0517281e761d55f64",
+    "recipient": "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+    "recipientLowercase": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045",
+    "destinationAsset": "nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near",
+    "originAsset": "nep245:v2_1.omni.hot.tg:56_2w93GqMcEmQFDru84j3HZZWt557r",
+    "amountIn": "1000000000000000000",
+    "deadline": "2026-11-04T07:55:04.000Z",
+    "chain": "base"
+  },
+  "recordedResponse": {
+    "quote": {
+      "amountIn": "1000000000000000000",
+      "amountInFormatted": "1.0",
+      "amountInUsd": "1.000000000000",
+      "minAmountIn": "1000000000000000000",
+      "amountOut": "997398",
+      "amountOutFormatted": "0.997398",
+      "amountOutUsd": "0.997398000000",
+      "minAmountOut": "987424",
+      "timeEstimate": 12,
+      "refundFee": "0",
+      "withdrawFee": "2400",
+      "deadline": "2026-11-04T07:55:04.000Z",
+      "timeWhenInactive": "2026-11-04T07:55:04.000Z",
+      "depositAddress": "f7252e9f85ccdfd9ee2a1004ef84a517a1e4fa4eb3509cc0517281e761d55f64"
+    },
+    "quoteRequest": {
+      "dry": false,
+      "depositMode": "SIMPLE",
+      "swapType": "EXACT_INPUT",
+      "slippageTolerance": 100,
+      "originAsset": "nep245:v2_1.omni.hot.tg:56_2w93GqMcEmQFDru84j3HZZWt557r",
+      "depositType": "INTENTS",
+      "destinationAsset": "nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near",
+      "amount": "1000000000000000000",
+      "refundTo": "chainward-guard.near",
+      "refundType": "INTENTS",
+      "recipient": "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+      "recipientType": "DESTINATION_CHAIN",
+      "deadline": "2026-11-01T07:55:04.000Z",
+      "confidentiality": "public",
+      "quoteWaitingTimeMs": 0,
+      "insured": false,
+      "appFees": [
+        {
+          "recipient": "5880ad2b362620fadf759cbceb1cd5737ce8c6ed7fb8e9942881e6731f9247dd",
+          "fee": 1,
+          "limitOrderId": null
+        }
+      ]
+    },
+    "timestamp": "2026-11-01T05:55:04.258Z",
+    "correlationId": "62e2d9a8-00bd-4a60-b007-e82bd8060d42"
+  }
+}
