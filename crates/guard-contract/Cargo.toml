@@ -1,0 +1,24 @@
+[package]
+name = "guard-contract"
+description = "The NEAR agent payment guard contract: holds funds, releases on a signed verdict plus policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Pinned exactly to a release more than two weeks old (5.29.1, 2026-09-17); a caret
+# range would pull 5.30.0, which is only days old. ed25519_verify has been stable
+# since 5.0.0 (NEP-364), well before this version.
+near-sdk = "=5.29.1"
+# The canonical encoding and shape validation, shared with the TypeScript signer.
+guard-auth = { path = "../guard-auth" }
+
+[dev-dependencies]
+# Unit-testing brings in the mocked VM (VMContextBuilder, testing_env!, the real
+# ed25519 host function implementation). ed25519-dalek signs the test fixtures.
+near-sdk = { version = "=5.29.1", features = ["unit-testing"] }
+ed25519-dalek = "2.1"
