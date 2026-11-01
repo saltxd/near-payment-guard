@@ -1,0 +1,13 @@
+[package]
+name = "intents-stub"
+description = "Test-only stand-in for NEAR Intents (intents.near): receives the guard's mt_transfer in a sandbox, where NEAR Intents has no testnet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "=5.29.1"

@@ -4,11 +4,13 @@
 
 Built at NEAR HACKATHON. Track: AI Security & Defense.
 
-> **Status: day 1 of 10.** The canonical signing format and its cross-language test
-> vectors are complete and green. The contract, the API route and the demo are not
-> written yet. Every section below marked **[NOT BUILT YET]** is a placeholder with the
-> intended shape, not a description of working code. Nothing in this README claims
-> something runs unless you can run it from the steps given.
+> **Status: in progress.** The canonical signing format and its cross-language vectors, the
+> guard contract (policy, signed-verdict gate, nonce/replay, rolling caps, the owner-registered
+> chain allowlist, and the 1Click quote-signature binding), and the nine-scenario
+> `near-workspaces` sandbox demo are complete and green. The verdict API route, the testnet
+> deploy and the video are not written yet; sections marked **[NOT BUILT YET]** are placeholders
+> with the intended shape, not working code. Nothing here claims something runs unless you can run
+> it from the steps given.
 
 ---
 
@@ -139,14 +141,22 @@ contract semantics begin. Section 7 works a complete 173-byte message out by han
 that hand-derived value is asserted in both test suites, so neither implementation can
 drift from the document.
 
-### 3. **[NOT BUILT YET]** The guard contract
+### 3. The guard contract: the nine scenarios in a sandbox
 
-Planned for days 2 to 5. The nine demo scenarios below will run in a `near-workspaces`
-sandbox with one command.
+```bash
+npm run test:sandbox
+```
+
+This compiles both contracts, lowers them to NEAR-deployable wasm, fetches the matching
+`near-sandbox` (neard) binary if needed, and runs the nine scenarios against the real compiled
+guard in a local [`near-workspaces`](https://github.com/near/near-workspaces-js) sandbox. Each
+prints a human line, so the output reads as a story. (Needs a Rust toolchain with the
+`wasm32-unknown-unknown` target; if the sandbox binary cannot start, the scenarios skip cleanly
+rather than fail.)
 
 | # | Scenario | Expected |
 |---|---|---|
-| 1 | Agent pays a clean address inside policy | PAID, guard balance drops |
+| 1 | Agent pays a clean address inside policy | PAID, released via `mt_transfer` to the intents account |
 | 2 | Agent tries to pay a sanctioned address | REFUSED, "verdict: hold, sanctions list match" |
 | 3 | Agent replays scenario 1's authorization | REFUSED, "nonce already used" |
 | 4 | Agent edits the destination, keeps the signature | REFUSED, "bad signature" |
@@ -156,7 +166,16 @@ sandbox with one command.
 | 8 | Agent calls any other method with its key | REFUSED by the protocol, not by our code |
 | 9 | Compromised agent tries to transfer out directly | IMPOSSIBLE, the key cannot attach a deposit |
 
-Scenarios 8 and 9 are the ones that make the point: they fail at the protocol layer.
+Scenario 1 asks for the payment through the agent's restricted function-call key, exactly as a
+real agent would. Scenarios 8 and 9 are the ones that make the point: they fail at the NEAR
+protocol layer, before any of our code runs.
+
+**Two sandbox details, disclosed.** NEAR Intents has no testnet, so the guard is pointed at a
+local `intents-stub` (`crates/intents-stub/`) that receives the `mt_transfer`; and the 1Click leg
+uses synthetic quotes signed by a throwaway key the sandbox registers as 1Click's, so the scenarios
+can vary the deposit address, recipient, amount and chain. The Rust suite proves the identical
+quote-signature verification against a genuine production 1Click signature
+(`fixtures/1click-quote.json`).
 
 ### 4. **[NOT BUILT YET]** The verdict API
 
@@ -187,14 +206,21 @@ than let a judge discover it.
 
 ### Libraries, templates and prior art
 
-- **near-sdk-rs** for the contract **[to be added, day 2]**
-- **near-workspaces** for the sandbox test suite **[to be added, day 8]**
+- **near-sdk-rs** (`=5.29.1`) for the contract. The on-chain wasm is built with `--cfg near`
+  and lowered with `wasm-opt` to the feature set NEAR's VM accepts — the same two things
+  `cargo-near` does internally; we do them directly (`.cargo/config.toml`,
+  `scripts/build-contracts.mjs`) so the only toolchain needed is cargo + npm
+- **near-workspaces** (`5.0.0`) for the sandbox suite, plus **near-sandbox**: that release bundles
+  neard 2.6.2, which is too old for near-sdk 5.29.1's host imports, so `scripts/ensure-sandbox.mjs`
+  fetches the matching neard (2.13.4) from NEAR's official release bucket
+- **binaryen** (`wasm-opt`) — dev-only, to lower post-MVP wasm features (bulk-memory, sign-ext,
+  reference-types, multivalue) that NEAR's VM rejects at deploy time
+- **near-api-js** — dev-only, used in the sandbox to add the agent's restricted function-call key
 - **ed25519-dalek** — test-only, to cross-check signatures. The contract itself calls
   `env::ed25519_verify`, a host function needing no crate
-- **Node's built-in `node:crypto`** for signing. The TypeScript side has **no runtime
-  dependencies**
+- **Node's built-in `node:crypto`** for signing. The signer has **no runtime dependencies**; the
+  npm dependencies above are all dev-only, for typechecking and the sandbox demo
 - **serde / serde_json / hex / sha2** — Rust dev-dependencies, for reading the fixture
-- **TypeScript** — the only npm dev-dependency, for typechecking
 - **No project template was used.** The repository layout is our own
 - **Prior art we read and are not pretending does not exist:** Peerfolio /
   beneviolabs `autonomous-trading-account`, whose quote-signature verification and
@@ -242,14 +268,21 @@ crates/guard-auth/            Rust: canonical encoder + shape validation, zero d
   src/canonical.rs            the byte layout
   src/validate.rs             the shape rules
   tests/vectors.rs            cross-language agreement against the fixture
+crates/guard-contract/        Rust: the guard contract (near-sdk)
+  src/lib.rs                  policy, the signed-verdict gate, nonce/replay, rolling caps, asset allowlist
+  src/oneclick.rs             the 1Click quote-signature verification and binding
+crates/intents-stub/          Rust: a test-only stand-in for intents.near (sandbox only)
 
 ts/src/canonical.ts           TypeScript: the same byte layout
 ts/src/validate.ts            the same shape rules
 ts/src/sign.ts                ed25519 signing, no dependencies
 ts/scripts/generate-vectors.ts the fixture generator
 ts/test/                      spec conformance + fixture verification
+ts/sandbox/                   the nine-scenario near-workspaces demo (npm run test:sandbox)
 
-contracts/guard/              [NOT BUILT YET] the NEAR contract, day 2
+scripts/build-contracts.mjs   cargo build + wasm-opt lowering into out/
+scripts/ensure-sandbox.mjs    fetch the neard version near-sdk 5.29.1 needs
+fixtures/1click-quote.json    a real captured 1Click quote with its signature
 ```
 
 ## License

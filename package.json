@@ -11,11 +11,17 @@
   "scripts": {
     "test": "node --test ts/test/*.test.ts",
     "typecheck": "tsc --noEmit",
+    "build:contract": "node scripts/build-contracts.mjs",
+    "pretest:sandbox": "npm run build:contract && node scripts/ensure-sandbox.mjs",
+    "test:sandbox": "node --test ts/sandbox/*.test.ts",
     "vectors:generate": "node ts/scripts/generate-vectors.ts",
     "vectors:check": "node ts/scripts/generate-vectors.ts --check"
   },
   "devDependencies": {
-    "typescript": "5.9.2",
-    "@types/node": "22.15.3"
+    "@types/node": "22.15.3",
+    "binaryen": "123.0.0",
+    "near-api-js": "5.1.1",
+    "near-workspaces": "5.0.0",
+    "typescript": "5.9.2"
   }
 }

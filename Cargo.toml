@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/guard-auth", "crates/guard-contract"]
+members = ["crates/guard-auth", "crates/guard-contract", "crates/intents-stub"]
 
 [workspace.package]
 version = "0.1.0"

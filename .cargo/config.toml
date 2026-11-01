@@ -1,0 +1,15 @@
+# Build flags for the on-chain wasm target. Host builds (cargo test / clippy on the native target)
+# are unaffected.
+#
+# --cfg near            Selects near-sdk's on-chain host path -- the same flag cargo-near sets.
+#                       Without it, near-sdk-env gates its `host` block behind
+#                       cfg(all(near, target_arch = "wasm32")) and falls back to a local panic!()
+#                       that traps as a bare `unreachable`, so contract panic messages
+#                       (require! / env::panic_str) never reach the chain. With it, a refusal
+#                       surfaces as "Smart contract panicked: <message>".
+# -C target-cpu=mvp     Trims some post-MVP wasm features up front. Modern rustc/LLVM still emit a
+#                       few (bulk-memory, sign-ext, nontrapping-fptoint, reference-types, multivalue)
+#                       that NEAR's VM rejects at deploy time ("PrepareError: Deserialization");
+#                       scripts/build-contracts.mjs runs wasm-opt to lower the remainder.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", "near", "-C", "target-cpu=mvp"]

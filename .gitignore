@@ -6,6 +6,7 @@ Cargo.lock.orig
 
 # Compiled contract artifacts
 res/
+out/
 *.wasm
 
 # --- Node / TypeScript ---

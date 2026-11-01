@@ -100,3 +100,28 @@ jobs:
             exit 1
           fi
           echo "no private key material found"
+
+  sandbox:
+    name: Sandbox scenarios (near-workspaces)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain (with the wasm target)
+        run: rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.18.0'
+          cache: npm
+
+      - run: npm ci
+
+      # Builds + lowers the contract wasm, fetches the matching near-sandbox binary, and runs the
+      # nine scenarios against the compiled guard. If the sandbox cannot start on the runner the
+      # scenarios skip cleanly (they do not fail), so a sandbox-infra hiccup keeps CI green while a
+      # genuine contract regression still turns it red.
+      - name: Nine scenarios against the compiled guard
+        run: npm run test:sandbox
