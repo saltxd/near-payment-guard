@@ -20,7 +20,7 @@
 //! are Stage C.
 
 use near_sdk::json_types::{Base64VecU8, U128, U64};
-use near_sdk::store::LookupSet;
+use near_sdk::store::{LookupSet, Vector};
 use near_sdk::{
     env, near, require, AccountId, BorshStorageKey, NearToken, PanicOnDefault, Promise,
 };
@@ -30,6 +30,14 @@ const PUBKEY_LEN: usize = 32;
 
 /// Length of an ed25519 signature, in bytes.
 const SIGNATURE_LEN: usize = 64;
+
+/// The rolling window the daily and per-counterparty caps are measured over.
+const SECONDS_PER_DAY: u64 = 86_400;
+
+/// Current block time, in unix seconds. Block time is nanoseconds on NEAR.
+fn now_seconds() -> u64 {
+    env::block_timestamp() / 1_000_000_000
+}
 
 /// The owner-set rules the guard enforces on every payment.
 ///
@@ -125,12 +133,26 @@ pub struct PaymentResult {
     pub nonce: U128,
 }
 
+/// One honoured payment, kept so the rolling 24h caps can be measured.
+#[near(serializers = [borsh])]
+#[derive(Clone)]
+struct Spend {
+    /// Unix seconds the payment was made.
+    at_sec: u64,
+    /// Amount paid.
+    amount: u128,
+    /// The EVM destination it counts against (not the NEAR deposit address).
+    destination: String,
+}
+
 /// Storage prefixes for the collections the contract owns.
 #[derive(BorshStorageKey)]
 #[near]
 enum StorageKey {
     /// Nonces already honoured, so a signed authorization cannot be replayed.
     UsedNonces,
+    /// The recent payments the rolling caps are measured over.
+    Spends,
 }
 
 /// Guard contract state.
@@ -145,8 +167,10 @@ pub struct GuardContract {
     /// The active policy.
     policy: Policy,
     /// Replay protection. A nonce is recorded the first time it is honoured and
-    /// refused ever after. Populated by `request_payment` in a later stage.
+    /// refused ever after.
     used_nonces: LookupSet<u128>,
+    /// Recent honoured payments, pruned to the last 24h, for the rolling caps.
+    spends: Vector<Spend>,
 }
 
 #[near]
@@ -161,6 +185,7 @@ impl GuardContract {
             chainward_pubkey: to_pubkey(chainward_pubkey),
             policy,
             used_nonces: LookupSet::new(StorageKey::UsedNonces),
+            spends: Vector::new(StorageKey::Spends),
         }
     }
 
@@ -220,13 +245,19 @@ impl GuardContract {
     ///    attacker-chosen (this orders the signature before the verdict gate, unlike
     ///    `design.md` section 4, which checks the verdict first to save a trivial amount
     ///    of gas; see the stage notes);
-    /// 5. the verdict is `"pay"`; a `hold`/`unknown` is refused with its signed reason;
-    /// 6. the nonce has not been used, then it is recorded;
-    /// 7. the amount is within the per-transaction cap.
+    /// 5. freshness: the quote has not expired, the verdict is within
+    ///    `max_verdict_age_sec`, and it was not issued after its own quote expired;
+    /// 6. the verdict is `"pay"`; a `hold`/`unknown` is refused with its signed reason;
+    /// 7. the nonce has not been used, then it is recorded;
+    /// 8. policy: the destination is not denylisted and (if an allowlist is set) is on
+    ///    it; the amount is within the per-transaction cap, the rolling 24h daily cap,
+    ///    and the rolling 24h per-counterparty cap.
     ///
-    /// Then it pays the signed `deposit_address` and returns [`PaymentResult`]. The
-    /// demo pays with a native NEAR transfer; the production flow releases a NEP-245
-    /// balance held inside `intents.near` via `mt_transfer` (see the design).
+    /// Then it records the spend, pays the signed `deposit_address` and returns
+    /// [`PaymentResult`]. The demo pays with a native NEAR transfer; the production flow
+    /// releases a NEP-245 balance held inside `intents.near` via `mt_transfer` (see the
+    /// design). The allow/deny lists and the per-counterparty cap key on the EVM
+    /// `destination`, not the NEAR `deposit_address`.
     pub fn request_payment(
         &mut self,
         auth: PaymentAuthArgs,
@@ -257,33 +288,76 @@ impl GuardContract {
             "bad signature"
         );
 
-        // 5. Verdict gate. The reason is now ChainWard-signed, so it is safe to echo.
+        // 5. Freshness: the quote must not have expired, the verdict must be recent,
+        //    and a verdict cannot be issued after its own quote expired.
+        let now_sec = now_seconds();
+        require!(now_sec < auth.quote_expiry.0, "quote expired");
+        require!(
+            auth.issued_at.0 <= auth.quote_expiry.0,
+            "issued after expiry"
+        );
+        require!(
+            now_sec.saturating_sub(auth.issued_at.0) <= self.policy.max_verdict_age_sec,
+            "verdict too old"
+        );
+
+        // 6. Verdict gate. The reason is now ChainWard-signed, so it is safe to echo.
         require!(
             auth.verdict == "pay",
             format!("verdict: {}, {}", auth.verdict, auth.reason)
         );
 
-        // 6. Replay: a nonce is honoured at most once.
+        // 7. Replay: a nonce is honoured at most once.
         require!(
             !self.used_nonces.contains(&auth.nonce.0),
             "nonce already used"
         );
         self.used_nonces.insert(auth.nonce.0);
 
-        // 7. Per-transaction cap.
+        // 8. Policy. Membership gates first (a banned payee is refused outright),
+        //    then the amount caps. Lists and per-counterparty caps key on the EVM
+        //    destination, not the NEAR deposit address.
+        let amount = auth.amount.0;
         require!(
-            auth.amount.0 <= self.policy.per_tx_cap.0,
+            !self.policy.denylist.contains(&auth.destination),
+            "destination on denylist"
+        );
+        require!(
+            self.policy.allowlist.is_empty() || self.policy.allowlist.contains(&auth.destination),
+            "destination not on allowlist"
+        );
+        require!(
+            amount <= self.policy.per_tx_cap.0,
             "amount exceeds per-transaction cap"
         );
 
-        // Pay the one address the signature bound us to.
+        self.prune(now_sec);
+        let spent_total = self.sum_window(now_sec, None);
+        let spent_counterparty = self.sum_window(now_sec, Some(&auth.destination));
+        require!(
+            spent_total.saturating_add(amount) <= self.policy.daily_cap.0,
+            "daily cap exceeded"
+        );
+        require!(
+            spent_counterparty.saturating_add(amount) <= self.policy.per_counterparty_cap.0,
+            "counterparty cap exceeded"
+        );
+
+        // 9. Record the spend against the rolling window.
+        self.spends.push(Spend {
+            at_sec: now_sec,
+            amount,
+            destination: auth.destination.clone(),
+        });
+
+        // 10. Pay the one address the signature bound us to. The transfer is scheduled
+        //     as a receipt when this Promise is dropped; the method still returns
+        //     PaymentResult. Bound to `_` to consume the #[must_use].
         let payee: AccountId = auth
             .deposit_address
             .parse()
             .unwrap_or_else(|_| env::panic_str("deposit_address is not a NEAR account"));
-        // The transfer is scheduled as a receipt when this Promise is dropped; the
-        // method still returns PaymentResult. Bound to `_` to consume the #[must_use].
-        let _ = Promise::new(payee).transfer(NearToken::from_yoctonear(auth.amount.0));
+        let _ = Promise::new(payee).transfer(NearToken::from_yoctonear(amount));
 
         PaymentResult {
             paid: true,
@@ -319,6 +393,16 @@ impl GuardContract {
     pub fn is_nonce_used(&self, nonce: U128) -> bool {
         self.used_nonces.contains(&nonce.0)
     }
+
+    /// Total paid across all destinations in the last 24h.
+    pub fn get_spent_24h(&self) -> U128 {
+        U128(self.sum_window(now_seconds(), None))
+    }
+
+    /// Total paid to one EVM destination in the last 24h.
+    pub fn get_counterparty_spent(&self, destination: String) -> U128 {
+        U128(self.sum_window(now_seconds(), Some(&destination)))
+    }
 }
 
 impl GuardContract {
@@ -331,6 +415,44 @@ impl GuardContract {
     fn available_balance(&self) -> NearToken {
         let locked = env::storage_byte_cost().saturating_mul(u128::from(env::storage_usage()));
         env::account_balance().saturating_sub(locked)
+    }
+
+    /// Sum of in-window spends, optionally filtered to one destination.
+    ///
+    /// Read-only: it never prunes, so the views are safe to call on `&self`. The
+    /// window filter here is what makes a view correct even between prunes.
+    fn sum_window(&self, now_sec: u64, destination: Option<&str>) -> u128 {
+        let window_start = now_sec.saturating_sub(SECONDS_PER_DAY);
+        let mut total = 0u128;
+        for spend in self.spends.iter() {
+            let in_window = spend.at_sec >= window_start;
+            let matches = destination.is_none_or(|d| spend.destination == d);
+            if in_window && matches {
+                total = total.saturating_add(spend.amount);
+            }
+        }
+        total
+    }
+
+    /// Drops spends older than the rolling window, so storage does not grow without
+    /// bound. Rebuilds only when something is actually stale (`store::Vector` has no
+    /// `retain`).
+    fn prune(&mut self, now_sec: u64) {
+        let window_start = now_sec.saturating_sub(SECONDS_PER_DAY);
+        let any_stale = self.spends.iter().any(|s| s.at_sec < window_start);
+        if !any_stale {
+            return;
+        }
+        let kept: Vec<Spend> = self
+            .spends
+            .iter()
+            .filter(|s| s.at_sec >= window_start)
+            .cloned()
+            .collect();
+        self.spends.clear();
+        for spend in kept {
+            self.spends.push(spend);
+        }
     }
 }
 
@@ -537,10 +659,21 @@ mod tests {
         key.sign(&bytes).to_bytes().to_vec().into()
     }
 
-    /// Context for a payment request: owner predecessor, a funded guard.
+    /// `valid_auth`'s `issued_at`, in nanoseconds, so block time can be set relative
+    /// to the verdict in freshness tests.
+    const ISSUED_AT_SEC: u64 = 1_762_000_000;
+
+    /// Context for a payment request: owner predecessor, a funded guard, block time
+    /// 60s after the verdict was issued (inside the freshness window).
     fn pay_env() {
+        pay_env_at(ISSUED_AT_SEC + 60);
+    }
+
+    /// `pay_env` with the block time set to `now_sec`.
+    fn pay_env_at(now_sec: u64) {
         testing_env!(context(accounts(1))
             .account_balance(NearToken::from_near(10))
+            .block_timestamp(now_sec * 1_000_000_000)
             .build());
     }
 
@@ -716,5 +849,207 @@ mod tests {
         let result = guard.request_payment(auth, signature);
         assert!(result.paid);
         assert_eq!(result.amount, U128(10));
+    }
+
+    // --- Stage C: freshness and the rolling policy engine ---
+
+    /// A lowercase EVM address made of one repeated hex digit.
+    fn evm(digit: &str) -> String {
+        format!("0x{}", digit.repeat(40))
+    }
+
+    /// A guard with a custom policy, the verdict key registered, owned by accounts(1).
+    fn guard_with_policy(key: &SigningKey, policy: Policy) -> GuardContract {
+        testing_env!(context(accounts(1)).build());
+        let pubkey: Base64VecU8 = key.verifying_key().to_bytes().to_vec().into();
+        GuardContract::new(accounts(1), pubkey, policy)
+    }
+
+    /// A "pay" authorization issued at `now_sec` (always fresh), for `amount` to
+    /// `destination`, with `nonce`.
+    fn fresh_auth(now_sec: u64, amount: u128, destination: &str, nonce: u128) -> PaymentAuthArgs {
+        PaymentAuthArgs {
+            guard_id: accounts(0).to_string(),
+            deposit_address: accounts(3).to_string(),
+            destination: destination.to_string(),
+            chain: "base".to_string(),
+            amount: U128(amount),
+            verdict: "pay".to_string(),
+            reason: "ok".to_string(),
+            issued_at: U64(now_sec),
+            quote_expiry: U64(now_sec + 900),
+            nonce: U128(nonce),
+        }
+    }
+
+    /// Sets the env to `now_sec`, signs a fresh auth and submits it.
+    fn request(
+        guard: &mut GuardContract,
+        key: &SigningKey,
+        now_sec: u64,
+        amount: u128,
+        destination: &str,
+        nonce: u128,
+    ) -> PaymentResult {
+        pay_env_at(now_sec);
+        let auth = fresh_auth(now_sec, amount, destination, nonce);
+        let signature = sign(&auth, key);
+        guard.request_payment(auth, signature)
+    }
+
+    #[test]
+    #[should_panic(expected = "verdict too old")]
+    fn a_stale_verdict_is_refused() {
+        // Scenario 6: a verdict issued more than max_verdict_age_sec (300s) ago.
+        let key = verdict_key();
+        let mut guard = guard_with(&key);
+        let auth = valid_auth(); // issued at ISSUED_AT_SEC, quote_expiry +900
+        pay_env_at(ISSUED_AT_SEC + 400); // age 400 > 300, but quote not yet expired
+        let signature = sign(&auth, &key);
+        let _ = guard.request_payment(auth, signature);
+    }
+
+    #[test]
+    #[should_panic(expected = "quote expired")]
+    fn an_expired_quote_is_refused() {
+        let key = verdict_key();
+        let mut guard = guard_with(&key);
+        let auth = valid_auth();
+        pay_env_at(ISSUED_AT_SEC + 1000); // past quote_expiry (+900)
+        let signature = sign(&auth, &key);
+        let _ = guard.request_payment(auth, signature);
+    }
+
+    #[test]
+    #[should_panic(expected = "destination on denylist")]
+    fn a_denylisted_destination_is_refused() {
+        let key = verdict_key();
+        let policy = Policy {
+            denylist: vec![evm("a")],
+            ..sample_policy()
+        };
+        let mut guard = guard_with_policy(&key, policy);
+        // valid_auth pays evm("a").
+        let _ = request(&mut guard, &key, ISSUED_AT_SEC, 5, &evm("a"), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "destination not on allowlist")]
+    fn a_destination_off_the_allowlist_is_refused() {
+        let key = verdict_key();
+        let policy = Policy {
+            allowlist: vec![evm("b")], // allows only evm("b")
+            ..sample_policy()
+        };
+        let mut guard = guard_with_policy(&key, policy);
+        let _ = request(&mut guard, &key, ISSUED_AT_SEC, 5, &evm("a"), 1);
+    }
+
+    #[test]
+    fn a_destination_on_the_allowlist_is_paid() {
+        let key = verdict_key();
+        let policy = Policy {
+            allowlist: vec![evm("a")],
+            ..sample_policy()
+        };
+        let mut guard = guard_with_policy(&key, policy);
+        let result = request(&mut guard, &key, ISSUED_AT_SEC, 5, &evm("a"), 1);
+        assert!(result.paid);
+    }
+
+    #[test]
+    fn small_payments_pay_until_the_daily_cap() {
+        // Scenario 7, the drain: daily cap 100, so 60 + 40 is honoured in full.
+        let key = verdict_key();
+        let policy = Policy {
+            per_tx_cap: U128(60),
+            daily_cap: U128(100),
+            per_counterparty_cap: U128(1000),
+            ..sample_policy()
+        };
+        let mut guard = guard_with_policy(&key, policy);
+        let a = evm("a");
+        assert!(request(&mut guard, &key, ISSUED_AT_SEC, 60, &a, 1).paid);
+        assert!(request(&mut guard, &key, ISSUED_AT_SEC, 40, &a, 2).paid);
+        assert_eq!(guard.get_spent_24h().0, 100, "the window total is the cap");
+    }
+
+    #[test]
+    #[should_panic(expected = "daily cap exceeded")]
+    fn a_payment_over_the_daily_cap_is_refused() {
+        // Scenario 7, the wall: the third payment would push the window past 100.
+        let key = verdict_key();
+        let policy = Policy {
+            per_tx_cap: U128(60),
+            daily_cap: U128(100),
+            per_counterparty_cap: U128(1000),
+            ..sample_policy()
+        };
+        let mut guard = guard_with_policy(&key, policy);
+        let a = evm("a");
+        assert!(request(&mut guard, &key, ISSUED_AT_SEC, 60, &a, 1).paid);
+        assert!(request(&mut guard, &key, ISSUED_AT_SEC, 40, &a, 2).paid);
+        let _ = request(&mut guard, &key, ISSUED_AT_SEC, 1, &a, 3);
+    }
+
+    #[test]
+    fn the_daily_cap_rolls_over_after_24h() {
+        // Scenario 7, clean rollover: a full window a day ago does not block today.
+        let key = verdict_key();
+        let policy = Policy {
+            per_tx_cap: U128(60),
+            daily_cap: U128(100),
+            per_counterparty_cap: U128(1000),
+            ..sample_policy()
+        };
+        let mut guard = guard_with_policy(&key, policy);
+        let a = evm("a");
+        assert!(request(&mut guard, &key, ISSUED_AT_SEC, 60, &a, 1).paid);
+        assert!(request(&mut guard, &key, ISSUED_AT_SEC, 40, &a, 2).paid);
+
+        // One day and a second later, yesterday's spend is out of the window.
+        let tomorrow = ISSUED_AT_SEC + SECONDS_PER_DAY + 1;
+        assert!(request(&mut guard, &key, tomorrow, 60, &a, 3).paid);
+        assert_eq!(
+            guard.get_spent_24h().0,
+            60,
+            "only today's payment is in the window"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "counterparty cap exceeded")]
+    fn a_payment_over_the_per_counterparty_cap_is_refused() {
+        let key = verdict_key();
+        let policy = Policy {
+            per_tx_cap: U128(60),
+            daily_cap: U128(1000),
+            per_counterparty_cap: U128(50),
+            ..sample_policy()
+        };
+        let mut guard = guard_with_policy(&key, policy);
+        let a = evm("a");
+        assert!(request(&mut guard, &key, ISSUED_AT_SEC, 40, &a, 1).paid);
+        let _ = request(&mut guard, &key, ISSUED_AT_SEC, 40, &a, 2); // 80 > 50
+    }
+
+    #[test]
+    fn the_per_counterparty_cap_is_isolated_per_destination() {
+        // One maxed destination does not block a different one.
+        let key = verdict_key();
+        let policy = Policy {
+            per_tx_cap: U128(60),
+            daily_cap: U128(1000),
+            per_counterparty_cap: U128(50),
+            ..sample_policy()
+        };
+        let mut guard = guard_with_policy(&key, policy);
+        let (a, b) = (evm("a"), evm("b"));
+        assert!(request(&mut guard, &key, ISSUED_AT_SEC, 40, &a, 1).paid);
+        assert!(request(&mut guard, &key, ISSUED_AT_SEC, 40, &b, 2).paid);
+
+        assert_eq!(guard.get_counterparty_spent(a).0, 40);
+        assert_eq!(guard.get_counterparty_spent(b).0, 40);
+        assert_eq!(guard.get_spent_24h().0, 80);
     }
 }
