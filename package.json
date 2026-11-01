@@ -14,6 +14,8 @@
     "build:contract": "node scripts/build-contracts.mjs",
     "pretest:sandbox": "npm run build:contract && node scripts/ensure-sandbox.mjs",
     "test:sandbox": "node --test ts/sandbox/*.test.ts",
+    "predemo": "npm run build:contract && node scripts/ensure-sandbox.mjs",
+    "demo": "node ts/sandbox/demo.ts",
     "vectors:generate": "node ts/scripts/generate-vectors.ts",
     "vectors:check": "node ts/scripts/generate-vectors.ts --check"
   },

@@ -170,6 +170,9 @@ Scenario 1 asks for the payment through the agent's restricted function-call key
 real agent would. Scenarios 8 and 9 are the ones that make the point: they fail at the NEAR
 protocol layer, before any of our code runs.
 
+For the same nine moments as a narrated walkthrough (a story to watch or record, rather than test
+output), run `npm run demo`.
+
 **Two sandbox details, disclosed.** NEAR Intents has no testnet, so the guard is pointed at a
 local `intents-stub` (`crates/intents-stub/`) that receives the `mt_transfer`; and the 1Click leg
 uses synthetic quotes signed by a throwaway key the sandbox registers as 1Click's, so the scenarios
