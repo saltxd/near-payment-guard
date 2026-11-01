@@ -24,8 +24,10 @@ pub mod oneclick;
 use near_sdk::json_types::{Base64VecU8, U128, U64};
 use near_sdk::store::{LookupSet, Vector};
 use near_sdk::{
-    env, near, require, AccountId, BorshStorageKey, NearToken, PanicOnDefault, Promise,
+    env, near, require, AccountId, BorshStorageKey, Gas, NearToken, PanicOnDefault, Promise,
 };
+
+use oneclick::SignedQuote;
 
 /// Length of a raw ed25519 public key, in bytes.
 const PUBKEY_LEN: usize = 32;
@@ -35,6 +37,15 @@ const SIGNATURE_LEN: usize = 64;
 
 /// The rolling window the daily and per-counterparty caps are measured over.
 const SECONDS_PER_DAY: u64 = 86_400;
+
+/// The NEAR Intents account the guard releases funds through. Funds leave the guard as an
+/// `mt_transfer` of its NEP-245 balance inside this contract to the quote's deposit address
+/// (design.md section 12). There is no NEAR Intents testnet, so this is the same on mainnet
+/// and in a sandbox mock.
+const INTENTS_ACCOUNT: &str = "intents.near";
+
+/// Gas attached to the `mt_transfer` cross-contract call.
+const GAS_FOR_MT_TRANSFER: Gas = Gas::from_tgas(30);
 
 /// Current block time, in unix seconds. Block time is nanoseconds on NEAR.
 fn now_seconds() -> u64 {
@@ -166,6 +177,10 @@ pub struct GuardContract {
     owner_id: AccountId,
     /// ChainWard's ed25519 verdict public key, raw 32 bytes. Rotatable by the owner.
     chainward_pubkey: [u8; PUBKEY_LEN],
+    /// The ed25519 keys 1Click signs quotes with, raw 32 bytes each. Seeded with the one
+    /// key 1Click's SDK hardcodes; the owner can rotate or carry a second through a 1Click
+    /// key change. A quote must be signed by one of these to be honoured.
+    oneclick_pubkeys: Vec<[u8; PUBKEY_LEN]>,
     /// The active policy.
     policy: Policy,
     /// Replay protection. A nonce is recorded the first time it is honoured and
@@ -185,6 +200,7 @@ impl GuardContract {
         Self {
             owner_id,
             chainward_pubkey: to_pubkey(chainward_pubkey),
+            oneclick_pubkeys: oneclick::ONE_CLICK_MANAGER_KEYS.to_vec(),
             policy,
             used_nonces: LookupSet::new(StorageKey::UsedNonces),
             spends: Vector::new(StorageKey::Spends),
@@ -201,6 +217,18 @@ impl GuardContract {
     pub fn set_chainward_pubkey(&mut self, chainward_pubkey: Base64VecU8) {
         self.assert_owner();
         self.chainward_pubkey = to_pubkey(chainward_pubkey);
+    }
+
+    /// Replaces the set of 1Click quote-signing keys. Owner only.
+    ///
+    /// 1Click's signing key is not published anywhere a contract can read, so a rotation on
+    /// their side is handled here: the owner can set the new key, or both the old and new key
+    /// while a change is in flight. An empty set is refused, because it would make every quote
+    /// unverifiable and silently brick the settlement leg.
+    pub fn set_oneclick_pubkeys(&mut self, pubkeys: Vec<Base64VecU8>) {
+        self.assert_owner();
+        require!(!pubkeys.is_empty(), "need at least one 1Click key");
+        self.oneclick_pubkeys = pubkeys.into_iter().map(to_pubkey).collect();
     }
 
     /// Funds the guard. Owner only, and a deposit must be attached.
@@ -255,15 +283,22 @@ impl GuardContract {
     ///    it; the amount is within the per-transaction cap, the rolling 24h daily cap,
     ///    and the rolling 24h per-counterparty cap.
     ///
-    /// Then it records the spend, pays the signed `deposit_address` and returns
-    /// [`PaymentResult`]. The demo pays with a native NEAR transfer; the production flow
-    /// releases a NEP-245 balance held inside `intents.near` via `mt_transfer` (see the
-    /// design). The allow/deny lists and the per-counterparty cap key on the EVM
+    /// Between the verdict gate and the nonce, it also verifies 1Click's **quote** signature
+    /// over `quote` and binds the two together: the quote's deposit address, recipient, chain
+    /// and amount must be the ones the verdict signed, the quote must not be dry or carry a
+    /// redirect vector, and its deposit deadline must still be in the future. So the guard
+    /// pays a deposit address only when 1Click has signed that it leads to the destination
+    /// ChainWard signed off on. See [`oneclick`].
+    ///
+    /// Then it records the spend and releases the funds. Funds leave as an `mt_transfer` of the
+    /// guard's NEP-245 balance inside [`INTENTS_ACCOUNT`] to the quote's deposit address
+    /// (design.md section 12). The allow/deny lists and the per-counterparty cap key on the EVM
     /// `destination`, not the NEAR `deposit_address`.
     pub fn request_payment(
         &mut self,
         auth: PaymentAuthArgs,
         signature: Base64VecU8,
+        quote: SignedQuote,
     ) -> PaymentResult {
         // 1. Only the owner (or the agent's restricted key on the owner's account).
         self.assert_owner();
@@ -309,6 +344,41 @@ impl GuardContract {
             format!("verdict: {}, {}", auth.verdict, auth.reason)
         );
 
+        // 6b. The cross-chain leg. Verify 1Click's own signature over the quote, then bind it
+        //     to the verdict. 1Click vouches for "this deposit address leads to this recipient
+        //     on this chain"; ChainWard vouched for "this recipient is safe". The agent holds
+        //     neither key, and the guard reads the destination out of the signed quote, never
+        //     from a free caller argument.
+        let terms = oneclick::verify_quote(&quote, &self.oneclick_pubkeys)
+            .unwrap_or_else(|e| env::panic_str(&e));
+        require!(!terms.dry, "quote is dry");
+        require!(
+            !terms.has_redirect_vector(),
+            "quote carries a redirect vector"
+        );
+        require!(
+            terms.deposit_address.as_deref() == Some(auth.deposit_address.as_str()),
+            "quote deposit address does not match the verdict"
+        );
+        require!(
+            terms.recipient.to_ascii_lowercase() == auth.destination,
+            "quote recipient does not match the verdict destination"
+        );
+        require!(
+            terms.destination_chain() == Some(auth.chain.as_str()),
+            "quote destination asset is not on the verdict's chain"
+        );
+        require!(
+            terms.amount_in == auth.amount.0.to_string(),
+            "quote amount does not match the verdict"
+        );
+        let quote_deadline = terms
+            .deadline
+            .as_deref()
+            .and_then(oneclick::parse_deadline_seconds)
+            .unwrap_or_else(|| env::panic_str("quote has no parseable deadline"));
+        require!(now_sec < quote_deadline, "quote deadline has passed");
+
         // 7. Replay: a nonce is honoured at most once.
         require!(
             !self.used_nonces.contains(&auth.nonce.0),
@@ -352,14 +422,29 @@ impl GuardContract {
             destination: auth.destination.clone(),
         });
 
-        // 10. Pay the one address the signature bound us to. The transfer is scheduled
-        //     as a receipt when this Promise is dropped; the method still returns
-        //     PaymentResult. Bound to `_` to consume the #[must_use].
-        let payee: AccountId = auth
-            .deposit_address
+        // 10. Release the funds: an `mt_transfer` of the guard's NEP-245 balance inside
+        //     `intents.near` to the quote's deposit address, which carries the swap to the
+        //     destination chain. `receiver_id` and `amount` are the ones the two signatures
+        //     bound us to; `token_id` is the origin asset read out of the verified quote.
+        //     `mt_transfer` requires exactly one yoctoNEAR. The call is scheduled as a receipt
+        //     when the Promise is dropped; `_` consumes the `#[must_use]`.
+        let intents: AccountId = INTENTS_ACCOUNT
             .parse()
-            .unwrap_or_else(|_| env::panic_str("deposit_address is not a NEAR account"));
-        let _ = Promise::new(payee).transfer(NearToken::from_yoctonear(amount));
+            .unwrap_or_else(|_| env::panic_str("intents account id is invalid"));
+        let mt_args = near_sdk::serde_json::json!({
+            "receiver_id": auth.deposit_address,
+            "token_id": terms.origin_asset,
+            "amount": auth.amount,
+            "memo": format!("chainward-guard nonce {}", auth.nonce.0),
+        })
+        .to_string()
+        .into_bytes();
+        let _ = Promise::new(intents).function_call(
+            "mt_transfer".to_string(),
+            mt_args,
+            NearToken::from_yoctonear(1),
+            GAS_FOR_MT_TRANSFER,
+        );
 
         PaymentResult {
             paid: true,
@@ -384,6 +469,14 @@ impl GuardContract {
     /// ChainWard's verdict public key, raw 32 bytes, base64-encoded.
     pub fn get_chainward_pubkey(&self) -> Base64VecU8 {
         self.chainward_pubkey.to_vec().into()
+    }
+
+    /// The 1Click quote-signing keys, each raw 32 bytes, base64-encoded.
+    pub fn get_oneclick_pubkeys(&self) -> Vec<Base64VecU8> {
+        self.oneclick_pubkeys
+            .iter()
+            .map(|k| k.to_vec().into())
+            .collect()
     }
 
     /// Balance not locked for storage staking: what `withdraw` can pay out.
@@ -480,6 +573,7 @@ fn to_signature(bytes: Base64VecU8) -> [u8; SIGNATURE_LEN] {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    use near_sdk::mock::MockAction;
     use near_sdk::test_utils::{accounts, get_created_receipts, VMContextBuilder};
     use near_sdk::testing_env;
 
@@ -630,11 +724,68 @@ mod tests {
         SigningKey::from_bytes(&[13u8; 32])
     }
 
-    /// A guard whose registered verdict key is `verdict_key()`, owned by `accounts(1)`.
+    /// A guard whose registered verdict key is `verdict_key()` and whose 1Click key is the
+    /// test manager key, owned by `accounts(1)`.
     fn guard_with(key: &SigningKey) -> GuardContract {
         testing_env!(context(accounts(1)).build());
         let pubkey: Base64VecU8 = key.verifying_key().to_bytes().to_vec().into();
-        GuardContract::new(accounts(1), pubkey, sample_policy())
+        let mut guard = GuardContract::new(accounts(1), pubkey, sample_policy());
+        register_test_oneclick_key(&mut guard);
+        guard
+    }
+
+    /// The throwaway key the tests use in place of 1Click's. Deterministic; protects nothing.
+    fn oneclick_key() -> SigningKey {
+        SigningKey::from_bytes(&[3u8; 32])
+    }
+
+    /// Points the guard's 1Click key set at [`oneclick_key`], so synthetic quotes verify.
+    fn register_test_oneclick_key(guard: &mut GuardContract) {
+        testing_env!(context(accounts(1)).build());
+        let key: Base64VecU8 = oneclick_key().verifying_key().to_bytes().to_vec().into();
+        guard.set_oneclick_pubkeys(vec![key]);
+    }
+
+    /// Signs `payload` exactly as 1Click does: ed25519 over `base58(sha256(payload))`.
+    fn sign_quote_payload(payload: &str, key: &SigningKey) -> SignedQuote {
+        let message = near_sdk::bs58::encode(env::sha256(payload.as_bytes())).into_string();
+        let sig = key.sign(message.as_bytes()).to_bytes();
+        SignedQuote {
+            payload: payload.to_string(),
+            signature: format!("ed25519:{}", near_sdk::bs58::encode(sig).into_string()),
+        }
+    }
+
+    /// A synthetic 1Click quote that matches `auth`, signed by the test manager key, with a
+    /// far-future deadline. Key order is irrelevant: `verify_quote` hashes whatever string this
+    /// produces, so the quote is self-consistent (only the committed real fixture needs the
+    /// exact key order 1Click uses).
+    fn quote_for(auth: &PaymentAuthArgs) -> SignedQuote {
+        let dest_asset = if auth.chain == "bsc" {
+            "nep245:v2_1.omni.hot.tg:56_test"
+        } else {
+            "nep141:base-0xtest.omft.near"
+        };
+        let payload = format!(
+            concat!(
+                r#"{{"amountIn":"{}","deadline":"2099-01-01T00:00:00.000Z","#,
+                r#""depositAddress":"{}","depositType":"INTENTS","destinationAsset":"{}","#,
+                r#""dry":false,"originAsset":"nep245:origin","recipient":"{}","#,
+                r#""recipientType":"DESTINATION_CHAIN"}}"#
+            ),
+            auth.amount.0, auth.deposit_address, dest_asset, auth.destination,
+        );
+        sign_quote_payload(&payload, &oneclick_key())
+    }
+
+    /// Submits `auth` + `signature` with a matching synthetic 1Click quote.
+    fn pay(
+        guard: &mut GuardContract,
+        auth: PaymentAuthArgs,
+        signature: Base64VecU8,
+    ) -> PaymentResult {
+        let quote = quote_for(&auth);
+        guard.request_payment(auth, signature, quote)
     }
 
     /// A shape-valid, in-policy "pay" authorization for this guard (`accounts(0)`),
@@ -687,20 +838,61 @@ mod tests {
         let auth = valid_auth();
         let signature = sign(&auth, &key);
 
-        let result = guard.request_payment(auth, signature);
+        let result = pay(&mut guard, auth, signature);
 
         assert!(result.paid);
         assert_eq!(result.amount, U128(5));
         assert_eq!(result.deposit_address, accounts(3).to_string());
         assert!(guard.is_nonce_used(U128(1)), "the nonce is now recorded");
 
+        // Funds leave as a single mt_transfer through intents.near, not a native transfer.
         let receipts = get_created_receipts();
-        assert_eq!(receipts.len(), 1, "exactly one transfer");
+        assert_eq!(receipts.len(), 1, "exactly one release");
         assert_eq!(
             receipts[0].receiver_id,
-            accounts(3),
-            "paid the deposit address"
+            "intents.near".parse::<AccountId>().unwrap(),
+            "released through intents.near"
         );
+    }
+
+    /// The release is an `mt_transfer` to the quote's deposit address, for the bound amount,
+    /// of the quote's origin asset, with the single required yoctoNEAR.
+    #[test]
+    fn the_release_is_a_well_formed_mt_transfer() {
+        let key = verdict_key();
+        let mut guard = guard_with(&key);
+        pay_env();
+        let auth = valid_auth();
+        let signature = sign(&auth, &key);
+        let _ = pay(&mut guard, auth, signature);
+
+        let receipts = get_created_receipts();
+        let action = &receipts[0].actions[0];
+        match action {
+            MockAction::FunctionCallWeight {
+                method_name,
+                args,
+                attached_deposit,
+                ..
+            } => {
+                assert_eq!(method_name, b"mt_transfer", "the NEP-245 transfer method");
+                assert_eq!(
+                    *attached_deposit,
+                    NearToken::from_yoctonear(1),
+                    "mt_transfer needs exactly one yoctoNEAR"
+                );
+                let v: near_sdk::serde_json::Value =
+                    near_sdk::serde_json::from_slice(args).expect("args are JSON");
+                assert_eq!(
+                    v["receiver_id"],
+                    accounts(3).to_string(),
+                    "pays the deposit address"
+                );
+                assert_eq!(v["amount"], "5", "the bound amount, as a string");
+                assert_eq!(v["token_id"], "nep245:origin", "the quote's origin asset");
+            }
+            other => panic!("expected an mt_transfer function call, got {other:?}"),
+        }
     }
 
     #[test]
@@ -713,7 +905,7 @@ mod tests {
         let signature = sign(&auth, &key);
         let mut tampered = auth;
         tampered.destination = format!("0x{}", "b".repeat(40));
-        let _ = guard.request_payment(tampered, signature);
+        let _ = pay(&mut guard, tampered, signature);
     }
 
     #[test]
@@ -729,7 +921,7 @@ mod tests {
         let signature = sign(&auth, &key);
         let mut redirected = auth;
         redirected.deposit_address = accounts(4).to_string();
-        let _ = guard.request_payment(redirected, signature);
+        let _ = pay(&mut guard, redirected, signature);
     }
 
     #[test]
@@ -741,7 +933,7 @@ mod tests {
         let auth = valid_auth();
         let impostor = SigningKey::from_bytes(&[99u8; 32]);
         let signature = sign(&auth, &impostor);
-        let _ = guard.request_payment(auth, signature);
+        let _ = pay(&mut guard, auth, signature);
     }
 
     #[test]
@@ -751,7 +943,7 @@ mod tests {
         let mut guard = guard_with(&key);
         pay_env();
         let auth = valid_auth();
-        let _ = guard.request_payment(auth, vec![0u8; 63].into());
+        let _ = pay(&mut guard, auth, vec![0u8; 63].into());
     }
 
     #[test]
@@ -763,10 +955,10 @@ mod tests {
         pay_env();
         let auth = valid_auth();
         let signature = sign(&auth, &key);
-        let first = guard.request_payment(auth.clone(), signature.clone());
+        let first = pay(&mut guard, auth.clone(), signature.clone());
         assert!(first.paid, "the first request is honoured");
         pay_env();
-        let _ = guard.request_payment(auth, signature);
+        let _ = pay(&mut guard, auth, signature);
     }
 
     #[test]
@@ -780,7 +972,7 @@ mod tests {
         let mut auth = valid_auth();
         auth.guard_id = "other-guard.near".to_string();
         let signature = sign(&auth, &key);
-        let _ = guard.request_payment(auth, signature);
+        let _ = pay(&mut guard, auth, signature);
     }
 
     #[test]
@@ -793,7 +985,7 @@ mod tests {
         let mut auth = valid_auth();
         auth.destination = format!("0x{}", "A".repeat(40));
         let signature = sign(&auth, &key);
-        let _ = guard.request_payment(auth, signature);
+        let _ = pay(&mut guard, auth, signature);
     }
 
     #[test]
@@ -808,7 +1000,7 @@ mod tests {
         auth.verdict = "hold".to_string();
         auth.reason = "sanctions list match".to_string();
         let signature = sign(&auth, &key);
-        let _ = guard.request_payment(auth, signature);
+        let _ = pay(&mut guard, auth, signature);
     }
 
     #[test]
@@ -821,7 +1013,7 @@ mod tests {
         let mut auth = valid_auth();
         auth.amount = U128(11);
         let signature = sign(&auth, &key);
-        let _ = guard.request_payment(auth, signature);
+        let _ = pay(&mut guard, auth, signature);
     }
 
     #[test]
@@ -836,7 +1028,7 @@ mod tests {
         testing_env!(context(accounts(2))
             .account_balance(NearToken::from_near(10))
             .build());
-        let _ = guard.request_payment(auth, signature);
+        let _ = pay(&mut guard, auth, signature);
     }
 
     #[test]
@@ -848,7 +1040,7 @@ mod tests {
         let mut auth = valid_auth();
         auth.amount = U128(10);
         let signature = sign(&auth, &key);
-        let result = guard.request_payment(auth, signature);
+        let result = pay(&mut guard, auth, signature);
         assert!(result.paid);
         assert_eq!(result.amount, U128(10));
     }
@@ -860,11 +1052,14 @@ mod tests {
         format!("0x{}", digit.repeat(40))
     }
 
-    /// A guard with a custom policy, the verdict key registered, owned by accounts(1).
+    /// A guard with a custom policy, the verdict key and the test 1Click key registered,
+    /// owned by accounts(1).
     fn guard_with_policy(key: &SigningKey, policy: Policy) -> GuardContract {
         testing_env!(context(accounts(1)).build());
         let pubkey: Base64VecU8 = key.verifying_key().to_bytes().to_vec().into();
-        GuardContract::new(accounts(1), pubkey, policy)
+        let mut guard = GuardContract::new(accounts(1), pubkey, policy);
+        register_test_oneclick_key(&mut guard);
+        guard
     }
 
     /// A "pay" authorization issued at `now_sec` (always fresh), for `amount` to
@@ -896,7 +1091,7 @@ mod tests {
         pay_env_at(now_sec);
         let auth = fresh_auth(now_sec, amount, destination, nonce);
         let signature = sign(&auth, key);
-        guard.request_payment(auth, signature)
+        pay(guard, auth, signature)
     }
 
     #[test]
@@ -908,7 +1103,7 @@ mod tests {
         let auth = valid_auth(); // issued at ISSUED_AT_SEC, quote_expiry +900
         pay_env_at(ISSUED_AT_SEC + 400); // age 400 > 300, but quote not yet expired
         let signature = sign(&auth, &key);
-        let _ = guard.request_payment(auth, signature);
+        let _ = pay(&mut guard, auth, signature);
     }
 
     #[test]
@@ -919,7 +1114,7 @@ mod tests {
         let auth = valid_auth();
         pay_env_at(ISSUED_AT_SEC + 1000); // past quote_expiry (+900)
         let signature = sign(&auth, &key);
-        let _ = guard.request_payment(auth, signature);
+        let _ = pay(&mut guard, auth, signature);
     }
 
     #[test]
@@ -1053,5 +1248,200 @@ mod tests {
         assert_eq!(guard.get_counterparty_spent(a).0, 40);
         assert_eq!(guard.get_counterparty_spent(b).0, 40);
         assert_eq!(guard.get_spent_24h().0, 80);
+    }
+
+    // --- The cross-chain settlement leg: binding the 1Click quote to the verdict ---
+    //
+    // These submit a clean, in-policy verdict (so the flow reaches the quote checks) with a
+    // deliberately wrong 1Click quote, and assert the guard refuses on the quote, not the verdict.
+
+    /// A quote payload matching `valid_auth` except for the fields passed in. `redirect` is a
+    /// raw JSON fragment ending in a comma (e.g. a `customRecipientMsg`) or empty.
+    fn quote_payload(
+        deposit: &str,
+        recipient: &str,
+        dest_asset: &str,
+        amount: &str,
+        deadline: &str,
+        redirect: &str,
+    ) -> String {
+        format!(
+            concat!(
+                r#"{{"amountIn":"{}","deadline":"{}",{}"depositAddress":"{}","#,
+                r#""depositType":"INTENTS","destinationAsset":"{}","dry":false,"#,
+                r#""originAsset":"nep245:origin","recipient":"{}","recipientType":"DESTINATION_CHAIN"}}"#
+            ),
+            amount, deadline, redirect, deposit, dest_asset, recipient,
+        )
+    }
+
+    const FAR_FUTURE: &str = "2099-01-01T00:00:00.000Z";
+
+    /// A guard + a valid signed verdict, the block time inside the freshness window.
+    fn verdict_and_guard() -> (GuardContract, PaymentAuthArgs, Base64VecU8) {
+        let key = verdict_key();
+        let guard = guard_with(&key);
+        pay_env();
+        let auth = valid_auth();
+        let signature = sign(&auth, &key);
+        (guard, auth, signature)
+    }
+
+    #[test]
+    #[should_panic(expected = "bad quote signature")]
+    fn a_quote_signed_by_an_unknown_key_is_refused() {
+        // The agent forges a quote with its own key. The guard's registered 1Click key did
+        // not sign it, so it is refused before any field is trusted.
+        let (mut guard, auth, signature) = verdict_and_guard();
+        let payload = quote_payload(
+            accounts(3).as_str(),
+            &auth.destination,
+            "nep141:base-0xtest.omft.near",
+            "5",
+            FAR_FUTURE,
+            "",
+        );
+        let forged = sign_quote_payload(&payload, &SigningKey::from_bytes(&[8u8; 32]));
+        let _ = guard.request_payment(auth, signature, forged);
+    }
+
+    #[test]
+    #[should_panic(expected = "quote deposit address does not match the verdict")]
+    fn a_quote_for_a_different_deposit_address_is_refused() {
+        // A genuine 1Click quote, but for a deposit address the verdict never signed.
+        let (mut guard, auth, signature) = verdict_and_guard();
+        let payload = quote_payload(
+            "someone-else.near",
+            &auth.destination,
+            "nep141:base-0xtest.omft.near",
+            "5",
+            FAR_FUTURE,
+            "",
+        );
+        let quote = sign_quote_payload(&payload, &oneclick_key());
+        let _ = guard.request_payment(auth, signature, quote);
+    }
+
+    #[test]
+    #[should_panic(expected = "quote recipient does not match the verdict destination")]
+    fn a_quote_to_a_different_recipient_is_refused() {
+        // 1Click says this deposit address lands somewhere other than the checked destination.
+        let (mut guard, auth, signature) = verdict_and_guard();
+        let payload = quote_payload(
+            accounts(3).as_str(),
+            &format!("0x{}", "b".repeat(40)),
+            "nep141:base-0xtest.omft.near",
+            "5",
+            FAR_FUTURE,
+            "",
+        );
+        let quote = sign_quote_payload(&payload, &oneclick_key());
+        let _ = guard.request_payment(auth, signature, quote);
+    }
+
+    #[test]
+    #[should_panic(expected = "quote carries a redirect vector")]
+    fn a_quote_with_a_redirect_vector_is_refused() {
+        // customRecipientMsg can send funds past the signed recipient; refuse the whole quote.
+        let (mut guard, auth, signature) = verdict_and_guard();
+        let payload = quote_payload(
+            accounts(3).as_str(),
+            &auth.destination,
+            "nep141:base-0xtest.omft.near",
+            "5",
+            FAR_FUTURE,
+            r#""customRecipientMsg":{"to":"0xevil"},"#,
+        );
+        let quote = sign_quote_payload(&payload, &oneclick_key());
+        let _ = guard.request_payment(auth, signature, quote);
+    }
+
+    #[test]
+    #[should_panic(expected = "quote destination asset is not on the verdict's chain")]
+    fn a_quote_on_the_wrong_chain_is_refused() {
+        // Verdict is for Base; the quote delivers on BNB Chain to the same address.
+        let (mut guard, auth, signature) = verdict_and_guard();
+        let payload = quote_payload(
+            accounts(3).as_str(),
+            &auth.destination,
+            "nep245:v2_1.omni.hot.tg:56_usdc",
+            "5",
+            FAR_FUTURE,
+            "",
+        );
+        let quote = sign_quote_payload(&payload, &oneclick_key());
+        let _ = guard.request_payment(auth, signature, quote);
+    }
+
+    #[test]
+    #[should_panic(expected = "quote amount does not match the verdict")]
+    fn a_quote_for_a_different_amount_is_refused() {
+        // The verdict covered 5; the quote would move 6.
+        let (mut guard, auth, signature) = verdict_and_guard();
+        let payload = quote_payload(
+            accounts(3).as_str(),
+            &auth.destination,
+            "nep141:base-0xtest.omft.near",
+            "6",
+            FAR_FUTURE,
+            "",
+        );
+        let quote = sign_quote_payload(&payload, &oneclick_key());
+        let _ = guard.request_payment(auth, signature, quote);
+    }
+
+    #[test]
+    #[should_panic(expected = "quote deadline has passed")]
+    fn an_expired_quote_deadline_is_refused() {
+        // The verdict is still fresh, but 1Click's deposit deadline is in the past, so the
+        // deposit address may be dead and funds would be lost.
+        let (mut guard, auth, signature) = verdict_and_guard();
+        let payload = quote_payload(
+            accounts(3).as_str(),
+            &auth.destination,
+            "nep141:base-0xtest.omft.near",
+            "5",
+            "2020-01-01T00:00:00.000Z",
+            "",
+        );
+        let quote = sign_quote_payload(&payload, &oneclick_key());
+        let _ = guard.request_payment(auth, signature, quote);
+    }
+
+    #[test]
+    fn the_owner_can_rotate_the_oneclick_keys() {
+        let mut guard = owned_guard();
+        testing_env!(context(accounts(1)).build());
+        let fresh: Base64VecU8 = SigningKey::from_bytes(&[21u8; 32])
+            .verifying_key()
+            .to_bytes()
+            .to_vec()
+            .into();
+        guard.set_oneclick_pubkeys(vec![fresh.clone()]);
+        assert_eq!(guard.get_oneclick_pubkeys(), vec![fresh]);
+    }
+
+    #[test]
+    #[should_panic(expected = "need at least one 1Click key")]
+    fn the_oneclick_key_set_cannot_be_emptied() {
+        let mut guard = owned_guard();
+        testing_env!(context(accounts(1)).build());
+        guard.set_oneclick_pubkeys(vec![]);
+    }
+
+    #[test]
+    #[should_panic(expected = "owner only")]
+    fn a_non_owner_cannot_rotate_the_oneclick_keys() {
+        let mut guard = owned_guard();
+        testing_env!(context(accounts(2)).build());
+        guard.set_oneclick_pubkeys(vec![vec![1u8; 32].into()]);
+    }
+
+    #[test]
+    fn the_guard_seeds_the_production_oneclick_key_by_default() {
+        let guard = owned_guard();
+        let keys = guard.get_oneclick_pubkeys();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].0, oneclick::ONE_CLICK_MANAGER_KEYS[0].to_vec());
     }
 }
