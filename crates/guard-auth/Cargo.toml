@@ -1,0 +1,24 @@
+[package]
+name = "guard-auth"
+description = "Canonical byte encoding and shape validation for guard payment authorizations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No runtime dependencies, deliberately.
+#
+# This crate is compiled into a NEAR contract, where every dependency is code
+# that ends up in the wasm and in the trusted computing base of a contract that
+# holds money. The encoder is ~100 lines of byte pushing; it does not need help.
+[dependencies]
+
+# Test-only. ed25519-dalek is here to cross-check signatures against the shared
+# vectors; the contract itself calls env::ed25519_verify, which is a host
+# function and needs no crate.
+[dev-dependencies]
+ed25519-dalek = "2.1"
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"

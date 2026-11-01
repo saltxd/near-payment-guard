@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push supersedes a pending run on the same branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (encoder, validator, vector agreement)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-features -- --nocapture
+
+  typescript:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22.18.0 is the oldest Node that runs TypeScript without a flag, and is
+        # what package.json promises. Development happens on current. Testing both
+        # ends stops the promise in package.json from quietly becoming false.
+        node-version: ['22.18.0', '24.x', '26.x']
+    name: TypeScript (Node ${{ matrix.node-version }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Tests
+        run: npm test
+
+  vectors:
+    name: Vectors are current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.18.0'
+          cache: npm
+
+      - run: npm ci
+
+      # The committed fixture is what the Rust suite reads. If it can drift from
+      # the generator, the cross-language agreement proves nothing: someone could
+      # edit the fixture until both sides pass.
+      - name: Regenerate and compare
+        run: npm run vectors:check
+
+  secrets:
+    name: No private keys
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The repository publishes a public key and derives throwaway test keys from
+      # a seed phrase at test time. A private key in any serialized form is a bug,
+      # not a style issue, so it fails the build rather than warning.
+      - name: Scan for key material
+        run: |
+          set -uo pipefail
+          patterns='BEGIN [A-Z ]*PRIVATE KEY|ed25519:[1-9A-HJ-NP-Za-km-z]{80,}|"private_key"|NEAR_VERDICT_SIGNING_KEY=.'
+          if git grep -nIE "$patterns" -- . ':(exclude).github/workflows/ci.yml'; then
+            echo "::error::possible private key material committed"
+            exit 1
+          fi
+          echo "no private key material found"

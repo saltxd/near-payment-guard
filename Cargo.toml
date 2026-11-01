@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/guard-auth"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/saltxd/near-payment-guard"
+
+# Settings the NEAR contract crate will need when it lands (build plan, Nov 2).
+# Declared here so adding the contract does not also change how it is compiled.
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true

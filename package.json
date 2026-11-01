@@ -1,0 +1,21 @@
+{
+  "name": "near-payment-guard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Off-chain signer and shared test vectors for the NEAR agent payment guard",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "test": "node --test ts/test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "vectors:generate": "node ts/scripts/generate-vectors.ts",
+    "vectors:check": "node ts/scripts/generate-vectors.ts --check"
+  },
+  "devDependencies": {
+    "typescript": "5.9.2",
+    "@types/node": "22.15.3"
+  }
+}

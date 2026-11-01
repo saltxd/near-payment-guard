@@ -1,0 +1,36 @@
+# --- Rust ---
+target/
+**/*.rs.bk
+*.pdb
+Cargo.lock.orig
+
+# Compiled contract artifacts
+res/
+*.wasm
+
+# --- Node / TypeScript ---
+node_modules/
+dist/
+*.tsbuildinfo
+npm-debug.log*
+.npm/
+
+# --- Keys and secrets: never commit anything that can sign ---
+# Test keys in this repo are DERIVED from a documented seed phrase at test time
+# and are never written to disk. These patterns are a backstop, not a policy.
+*.pem
+*.key
+*.p8
+*.pk8
+neardev/
+.near-credentials/
+*credentials*.json
+.env
+.env.*
+!.env.example
+
+# --- Editors / OS ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
