@@ -321,7 +321,7 @@ const verification = [
   verificationVector("wrong-public-key", "A real signature checked against a different key.", baseBytes, baseSig, otherSigner.publicKeyBytes, false),
   verificationVector("all-zero-signature", "64 zero bytes.", baseBytes, new Uint8Array(64), signer.publicKeyBytes, false),
   verificationVector("all-ff-signature", "64 bytes of 0xff: a non-canonical S far above the group order.", baseBytes, new Uint8Array(64).fill(0xff), signer.publicKeyBytes, false),
-  verificationVector("malleable-s-plus-l", "R || (S + L). A non-strict verifier accepts this, giving one authorization two valid signatures. nearcore uses verify_strict and Node uses OpenSSL; both must refuse it.", baseBytes, malleateS(baseSig), signer.publicKeyBytes, false),
+  verificationVector("malleable-s-plus-l", "R || (S + L). A non-strict verifier accepts this, giving one authorization two valid signatures. Node (OpenSSL) and dalek both refuse it; whether nearcore's host function is equally strict is confirmed when the contract wires it up.", baseBytes, malleateS(baseSig), signer.publicKeyBytes, false),
   verificationVector("foreign-domain", "The same fields under a different domain string. Proves a signature here is not reusable elsewhere.", foreignDomainMessage, baseSig, signer.publicKeyBytes, false),
   verificationVector("bumped-version-byte", "Version 2 bytes against a version 1 signature.", bumpedVersionMessage, baseSig, signer.publicKeyBytes, false),
 ];

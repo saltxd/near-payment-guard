@@ -817,7 +817,7 @@
     },
     {
       "name": "malleable-s-plus-l",
-      "description": "R || (S + L). A non-strict verifier accepts this, giving one authorization two valid signatures. nearcore uses verify_strict and Node uses OpenSSL; both must refuse it.",
+      "description": "R || (S + L). A non-strict verifier accepts this, giving one authorization two valid signatures. Node (OpenSSL) and dalek both refuse it; whether nearcore's host function is equally strict is confirmed when the contract wires it up.",
       "message_hex": "00000021636861696e776172642e6e6561722d7061796d656e742d67756172642e617574680100000006672e6e65617200000006642e6e6561720000002a30783030303030303030303030303030303030303030303030303030303030303030303030303030303100000004626173650000000000000000000000000000000100000003706179000000026f6b000000006905fc80000000006906000400000000000000000000000000000007",
       "public_key_hex": "0ae07b938297a1f89184061a591c7624b93666ce5d2a141a79a48032b4609716",
       "signature_hex": "7ea26ac01de22e17df723843ea1a57eacf5c184de5f217af334fdce7f50c619c265153e0edc2d0d26b7bc374060f03efb7f5e76ea7007249cf59847502b51315",

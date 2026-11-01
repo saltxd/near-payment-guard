@@ -244,12 +244,17 @@ to eyeball when a diff is long. Nothing signs or verifies it.
 
 On-chain this is `env::ed25519_verify(&sig, &bytes, &pubkey) -> bool` (near-sdk ≥ 5.0.0, NEP-364).
 
-**Strict verification.** nearcore implements that host function with ed25519-dalek's `verify_strict`,
-which rejects non-canonical `S` values and small-order public keys. The Rust tests here call
-`verify_strict` too, and the TypeScript side uses Node's built-in `crypto.verify`, which is OpenSSL
-and also enforces `S < L`. All three therefore reject the malleated signature in vector
-`sig-malleable-s-plus-l`. This is checked rather than assumed, because a verifier that accepts `S`
-and `S + L` treats one authorization as having two valid signatures.
+**Strict verification.** The Rust tests here call ed25519-dalek's `verify_strict`, which rejects
+non-canonical `S` values and small-order public keys. The TypeScript side uses Node's built-in
+`crypto.verify`, which is OpenSSL and enforces `S < L`. Both therefore reject the malleated
+signature in vector `malleable-s-plus-l`, which is measured rather than assumed: a verifier that
+accepts both `S` and `S + L` treats one authorization as having two valid signatures.
+
+> **To confirm on day 3, not assumed here:** nearcore is understood to implement
+> `env::ed25519_verify` with `verify_strict`, but that has not been read in the nearcore source
+> during this work. It is checked once the contract actually calls the host function. The vector
+> passes either way — dalek 2.x rejects a non-canonical `S` in plain `verify` as well — so this is a
+> claim to verify, not a risk to the test.
 
 **Message size and gas.** Worst case under section 5 is roughly 600 bytes. At
 `wasm_ed25519_verify_base` 210,000,000,000 and `wasm_ed25519_verify_byte` 9,000,000, that is
