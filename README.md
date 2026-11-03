@@ -94,7 +94,11 @@ reads the destination out of the quote blob it verified, never from a caller arg
 
 ## Run it yourself
 
-### 1. The part that works today: cross-language signing agreement
+**You need:** Node 22.18 or newer (CI runs 22.18, 24 and 26) and a stable Rust toolchain.
+Step 3 also needs the wasm target: `rustup target add wasm32-unknown-unknown`. No NEAR
+account, keys, funds or network access are needed for steps 1 to 3.
+
+### 1. Cross-language signing agreement
 
 The verdict is signed off-chain in TypeScript and verified on-chain in Rust. If those
 two disagree by one byte, the guard either refuses everything or pays the wrong
@@ -112,8 +116,10 @@ npm test
 cargo test -- --nocapture
 ```
 
-**What you should see.** `npm test` reports `pass 118`, `fail 0`. `cargo test` reports
-`10 passed` then `7 passed`, and the vector tests print how many fixtures agreed (the
+**What you should see.** `npm test` reports `pass 118`, `fail 0`. `cargo test` runs four
+suites and reports `10 passed`, `7 passed`, `70 passed` and `4 passed`, 91 in all: the
+signing crate's unit tests, its vector tests, the guard contract's unit tests, and the check
+of ChainWard's verdict route (section 4). The vector tests print how many fixtures agreed (the
 lines arrive in whatever order the tests finish):
 
 ```
@@ -180,10 +186,21 @@ can vary the deposit address, recipient, amount and chain. The Rust suite proves
 quote-signature verification against a genuine production 1Click signature
 (`fixtures/1click-quote.json`).
 
-### 4. **[NOT BUILT YET]** The verdict API
+### 4. The verdict API
 
-Planned for day 6: `POST /api/near/authorize` on ChainWard's existing API, returning a
-verdict plus an ed25519 signature over the canonical bytes.
+`POST /api/near/authorize` is part of ChainWard's existing API (saltxd/chainward PR #111). It
+runs ChainWard's counterparty, sanctions and look-alike checks on the destination and returns
+the verdict plus an ed25519 signature over the canonical bytes. `GET /api/near/public-key`
+returns the key to register in the contract.
+
+The proof that the route and the contract agree is `crates/guard-contract/tests/chainward_authorize.rs`
+(run by `cargo test` above). It feeds real responses of the route, recorded in
+`fixtures/chainward-authorize.json` and signed with a throwaway test key, into `request_payment`
+exactly as an agent would: the pay case is paid, the hold case is refused with ChainWard's
+signed reason, and any changed field fails as a bad signature.
+
+On the live API the signing key is not provisioned yet, so both routes currently answer
+`503 NOT_CONFIGURED`. The demo above needs neither.
 
 ### 5. **[NOT BUILT YET]** Testnet deployment and video
 
