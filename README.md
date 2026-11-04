@@ -116,7 +116,7 @@ npm test
 cargo test -- --nocapture
 ```
 
-**What you should see.** `npm test` reports `pass 118`, `fail 0`. `cargo test` runs four
+**What you should see.** `npm test` reports `pass 124`, `fail 0`. `cargo test` runs four
 suites and reports `10 passed`, `7 passed`, `70 passed` and `4 passed`, 91 in all: the
 signing crate's unit tests, its vector tests, the guard contract's unit tests, and the check
 of ChainWard's verdict route (section 4). The vector tests print how many fixtures agreed (the
@@ -202,9 +202,14 @@ signed reason, and any changed field fails as a bad signature.
 On the live API the signing key is not provisioned yet, so both routes currently answer
 `503 NOT_CONFIGURED`. The demo above needs neither.
 
-### 5. **[NOT BUILT YET]** Testnet deployment and video
+### 5. The demo video, and testnet
 
-Planned for day 9.
+`npm run video` records `npm run demo` and renders it to `out/video/demo.mp4` (1280x720, about 48 seconds): the
+demo's own output, line for line, with only the sandbox's waits between scenarios shortened. It needs Google Chrome
+(headless, to draw the frames) and ffmpeg with libx264. The frame timing is unit-tested in `ts/test/video-plan.test.ts`.
+
+**[NOT BUILT]** A testnet deployment. NEAR Intents has no testnet, so the sandbox above is the faithful demo; a testnet
+copy of the guard would show the same refusals against a stub.
 
 ---
 
@@ -299,6 +304,7 @@ ts/src/sign.ts                ed25519 signing, no dependencies
 ts/scripts/generate-vectors.ts the fixture generator
 ts/test/                      spec conformance + fixture verification
 ts/sandbox/                   the nine-scenario near-workspaces demo (npm run test:sandbox)
+ts/video/                     the demo video: frame plan (tested) and renderer (npm run video)
 
 scripts/build-contracts.mjs   cargo build + wasm-opt lowering into out/
 scripts/ensure-sandbox.mjs    fetch the neard version near-sdk 5.29.1 needs

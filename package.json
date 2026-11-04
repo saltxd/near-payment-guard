@@ -17,7 +17,8 @@
     "predemo": "npm run build:contract && node scripts/ensure-sandbox.mjs",
     "demo": "node ts/sandbox/demo.ts",
     "vectors:generate": "node ts/scripts/generate-vectors.ts",
-    "vectors:check": "node ts/scripts/generate-vectors.ts --check"
+    "vectors:check": "node ts/scripts/generate-vectors.ts --check",
+    "video": "node ts/video/render.ts"
   },
   "devDependencies": {
     "@types/node": "22.15.3",
