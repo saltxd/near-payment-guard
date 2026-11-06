@@ -90,6 +90,10 @@ Two independent signatures, each answering a different question:
 Neither party can forge the other's half, and the agent holds neither key. The guard
 reads the destination out of the quote blob it verified, never from a caller argument.
 
+[`docs/architecture.md`](docs/architecture.md) draws the same flow as a sequence diagram and lists
+every refusal `request_payment` can return, in the order the contract checks them (a test keeps
+the list in step with the contract).
+
 ---
 
 ## Run it yourself
@@ -116,7 +120,7 @@ npm test
 cargo test -- --nocapture
 ```
 
-**What you should see.** `npm test` reports `pass 124`, `fail 0`. `cargo test` runs four
+**What you should see.** `npm test` reports `pass 127`, `fail 0`. `cargo test` runs four
 suites and reports `10 passed`, `7 passed`, `70 passed` and `4 passed`, 91 in all: the
 signing crate's unit tests, its vector tests, the guard contract's unit tests, and the check
 of ChainWard's verdict route (section 4). The vector tests print how many fixtures agreed (the
@@ -287,6 +291,7 @@ Stated here because the README should not oversell the thing it documents.
 
 ```
 docs/canonical-bytes.md       the signing format specification
+docs/architecture.md         the payment flow as a sequence diagram, and every refusal in contract order
 vectors/canonical-vectors.json the shared fixture both languages read (generated, committed)
 
 crates/guard-auth/            Rust: canonical encoder + shape validation, zero dependencies
