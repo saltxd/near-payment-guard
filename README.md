@@ -246,7 +246,9 @@ than let a judge discover it.
 
 Independent second project (NEAR HACKATHON rule Q-015): the same person also entered
 **Headcount** (https://github.com/saltxd/headcount), screened reward payouts for Sputnik DAO
-and Trezu treasuries. Separate contract, user and problem; no shared code or service.
+and Trezu treasuries. Separate contract, user and problem; no shared service, and no shared code
+beyond two generic build scripts (sandbox setup and the wasm lowering step) that Headcount adapted
+from this repository and lists in its README.
 
 ### Libraries, templates and prior art
 
