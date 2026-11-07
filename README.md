@@ -242,6 +242,12 @@ repository: the NEAR contract, the canonical signing format, the verdict signing
 and the demo. The guard is a new consumer of an existing engine. We would rather say so
 than let a judge discover it.
 
+### Independent second project
+
+Independent second project (NEAR HACKATHON rule Q-015): the same person also entered
+**Headcount** (https://github.com/saltxd/headcount), screened reward payouts for Sputnik DAO
+and Trezu treasuries. Separate contract, user and problem; no shared code or service.
+
 ### Libraries, templates and prior art
 
 - **near-sdk-rs** (`=5.29.1`) for the contract. The on-chain wasm is built with `--cfg near`
