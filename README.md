@@ -7,10 +7,9 @@ Built at NEAR HACKATHON. Track: AI Security & Defense.
 > **Status: in progress.** The canonical signing format and its cross-language vectors, the
 > guard contract (policy, signed-verdict gate, nonce/replay, rolling caps, the owner-registered
 > chain allowlist, and the 1Click quote-signature binding), and the nine-scenario
-> `near-workspaces` sandbox demo are complete and green. The verdict API route, the testnet
-> deploy and the video are not written yet; sections marked **[NOT BUILT YET]** are placeholders
-> with the intended shape, not working code. Nothing here claims something runs unless you can run
-> it from the steps given.
+> `near-workspaces` sandbox demo are complete and green, and so are the verdict API route and the
+> demo video renderer. A testnet deploy is not built (section 5 says why). Nothing here claims
+> something runs unless you can run it from the steps given.
 
 ---
 
@@ -98,9 +97,19 @@ the list in step with the contract).
 
 ## Run it yourself
 
-**You need:** Node 22.18 or newer (CI runs 22.18, 24 and 26) and a stable Rust toolchain.
-Step 3 also needs the wasm target: `rustup target add wasm32-unknown-unknown`. No NEAR
-account, keys, funds or network access are needed for steps 1 to 3.
+**You need:** Node 22.18 or newer (CI runs 22.18, 24 and 26), a stable Rust toolchain with a
+C compiler and `git` on the PATH (a stock `node:22` Docker image has them; a minimal one does
+not), and, for step 3, the wasm target: `rustup target add wasm32-unknown-unknown`. No NEAR
+account, keys or funds are needed for steps 1 to 3. Steps 1 and 2 need no network once the
+packages are installed; step 3 downloads one binary (see below).
+
+**Machines that can run step 3 and the demo:** macOS on Apple Silicon, or Linux on x86_64 with
+glibc 2.39 or newer (Ubuntu 24.04, Debian 13). The sandbox binary (`neard`) is published only
+for those two. On Linux arm64 `npm ci` itself stops with `Unsupported platform: Linux arm64`
+(in an arm64 Docker host, add `--platform linux/amd64`). On an older Linux such as Debian 12
+or Ubuntu 22.04 the binary downloads but will not start (`GLIBC_2.39 not found`), the demo
+exits with an error, and `npm run test:sandbox` reports its nine scenarios as skipped, not
+passed. Steps 1 and 2 work anywhere Node and Rust do.
 
 ### 1. Cross-language signing agreement
 
@@ -120,7 +129,7 @@ npm test
 cargo test -- --nocapture
 ```
 
-**What you should see.** `npm test` reports `pass 127`, `fail 0`. `cargo test` runs four
+**What you should see.** `npm test` reports `pass 129`, `fail 0`. `cargo test` runs four
 suites and reports `10 passed`, `7 passed`, `70 passed` and `4 passed`, 91 in all: the
 signing crate's unit tests, its vector tests, the guard contract's unit tests, and the check
 of ChainWard's verdict route (section 4). The vector tests print how many fixtures agreed (the
