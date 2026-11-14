@@ -1,0 +1,12 @@
+# Keeps the SHA-pinned GitHub Actions current: one grouped PR a month, and never a release younger than 7 days.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
